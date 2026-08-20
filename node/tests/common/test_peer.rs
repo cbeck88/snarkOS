@@ -14,16 +14,33 @@
 // limitations under the License.
 
 use snarkos_account::Account;
-use snarkos_node_network::NodeType;
+use snarkos_node_network::{
+    NodeType,
+    noise::{HandshakeProtocol, PendingSession, Role, binding_message, detect_handshake_protocol, prepare_framed},
+};
 use snarkos_node_router::{
     expect_message,
-    messages::{ChallengeRequest, ChallengeResponse, Message, MessageCodec, MessageTrait},
+    messages::{
+        ChallengeRequest,
+        ChallengeResponse,
+        HANDSHAKE_DOMAIN,
+        HandshakeHint,
+        InitiatorInfo,
+        Message,
+        MessageCodec,
+        MessageTrait,
+        PeerInfo,
+        ResponderProof,
+    },
 };
 use snarkos_node_tcp::ConnectError;
 use snarkvm::{
     console::network::{MainnetV0 as CurrentNetwork, Network},
-    ledger::{block::Block, narwhal::Data},
-    prelude::{Address, Field, FromBytes, TestRng},
+    ledger::{
+        block::{Block, Header},
+        narwhal::Data,
+    },
+    prelude::{Address, Field, FromBytes, TestRng, ToBytes},
     utilities::into_io_error,
 };
 
@@ -44,7 +61,6 @@ use pea2pea::{
     protocols::{Handshake, OnDisconnect, Reading, Writing},
 };
 use rand::RngExt;
-use tokio_util::codec::Framed;
 use tracing::*;
 
 const ALEO_MAXIMUM_FORK_DEPTH: u32 = 4096;
@@ -142,7 +158,6 @@ impl TestPeer {
         let peer_addr = conn.addr();
         let node_side = !conn.side();
         let stream = self.borrow_stream(&mut conn);
-        let mut framed = Framed::new(stream, MessageCodec::<CurrentNetwork>::default());
 
         // Retrieve the genesis block header.
         let genesis_header = *sample_genesis_block().header();
@@ -151,6 +166,21 @@ impl TestPeer {
             "7562506206353711030068167991213732850758501012603348777370400520506564970105field",
         )
         .unwrap();
+
+        // When the node dials, it picks the handshake protocol; when this peer dials, it offers the
+        // legacy one, which is what keeps the transition covered from both directions.
+        let prefix = if node_side == ConnectionSide::Responder {
+            match detect_handshake_protocol(stream).await? {
+                (HandshakeProtocol::Noise, _) => {
+                    self.perform_noise_handshake(stream, local_ip, genesis_header, restrictions_id).await?;
+                    return Ok(conn);
+                }
+                (HandshakeProtocol::Legacy, prefix) => prefix,
+            }
+        } else {
+            Default::default()
+        };
+        let mut framed = prepare_framed(stream, MessageCodec::<CurrentNetwork>::default(), &prefix);
 
         // TODO(nkls): add assertions on the contents of messages.
         match node_side {
@@ -205,6 +235,50 @@ impl TestPeer {
         }
 
         Ok(conn)
+    }
+}
+
+impl TestPeer {
+    /// The responder side of the router's Noise handshake.
+    ///
+    /// This peer authenticates itself honestly and takes whatever the node offers on trust; the
+    /// checks are the node's to make, and it is the node under test here.
+    async fn perform_noise_handshake(
+        &self,
+        stream: &mut tokio::net::TcpStream,
+        local_ip: SocketAddr,
+        genesis_header: Header<CurrentNetwork>,
+        restrictions_id: Field<CurrentNetwork>,
+    ) -> Result<(), ConnectError> {
+        let rng = &mut TestRng::default();
+
+        /* Message 1: the node's cleartext hint. */
+
+        let pending = PendingSession::accept(stream).await?;
+        let _hint =
+            HandshakeHint::<CurrentNetwork>::from_bytes_le(pending.first_payload()?).map_err(ConnectError::other)?;
+
+        /* Message 2: disclose ourselves. */
+
+        let mut noise = pending.into_session()?;
+        let our_info =
+            PeerInfo::new(local_ip.port(), self.node_type(), self.address(), genesis_header, restrictions_id, None);
+        noise.send(&our_info.to_bytes_le().map_err(ConnectError::other)?).await?;
+
+        /* Message 3: the node's authenticated metadata and proof. */
+
+        let _peer =
+            InitiatorInfo::<CurrentNetwork>::from_bytes_le(&noise.recv().await?).map_err(ConnectError::other)?;
+
+        /* Message 4: our own proof. */
+
+        let binding = binding_message(HANDSHAKE_DOMAIN, Role::Responder, &noise.handshake_hash()?);
+        let mut noise = noise.into_transport_mode()?;
+        let our_signature = self.account().sign_bytes(&binding, rng).unwrap();
+        let proof = ResponderProof::<CurrentNetwork>::Accepted { signature: Data::Object(our_signature) };
+        noise.send(&proof.to_bytes_le().map_err(ConnectError::other)?).await?;
+
+        Ok(())
     }
 }
 

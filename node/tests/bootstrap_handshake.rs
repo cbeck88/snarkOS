@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The bootstrap client's side of the gateway's Noise handshake.
+//! The bootstrap client's side of the Noise handshake, in both of the modes it accepts.
 
 #[allow(dead_code)]
 mod common;
@@ -24,17 +24,19 @@ use snarkos_node::{
     BootstrapClient,
     bft::events::{DisconnectReason, Event, HANDSHAKE_DOMAIN, HandshakeHint, InitiatorInfo, PeerInfo, ResponderProof},
     network::{
+        NodeType,
         PeerPoolHandling,
         noise::{NoiseSession, Role, binding_message, write_noise_magic},
     },
+    router::messages::{self, Message},
     tcp::P2P,
 };
 use snarkvm::{
     ledger::narwhal::Data,
-    prelude::{FromBytes, MainnetV0 as CurrentNetwork, TestRng, ToBytes},
+    prelude::{Field, FromBytes, MainnetV0 as CurrentNetwork, TestRng, ToBytes},
 };
 
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, str::FromStr, time::Duration};
 
 use deadline::deadline;
 use tokio::net::TcpStream;
@@ -152,4 +154,91 @@ async fn a_bootstrap_client_rejects_an_unprovable_identity() {
     let verdict = ResponderProof::<CurrentNetwork>::from_bytes_le(&noise.recv().await.unwrap()).unwrap();
 
     assert_eq!(verdict, ResponderProof::Rejected { reason: DisconnectReason::InvalidChallengeResponse });
+}
+
+/// Drives the *router's* Noise handshake against a bootstrap client, up to the verdict.
+///
+/// The bootstrap client takes both subprotocols on one listener, so what settles which of the two
+/// this is, is the connection mode that opens the first message; see `ConnectionMode`.
+async fn router_handshake_with(
+    client: &BootstrapClient<CurrentNetwork>,
+    account: &Account<CurrentNetwork>,
+    node_type: NodeType,
+    restrictions_id: Option<Field<CurrentNetwork>>,
+) -> std::io::Result<Option<(messages::ResponderProof<CurrentNetwork>, NoiseSession<TcpStream>)>> {
+    let mut stream = TcpStream::connect(dial_addr(client)).await?;
+    write_noise_magic(&mut stream).await?;
+    let mut noise = NoiseSession::new(stream, Role::Initiator)?;
+
+    let version = Message::<CurrentNetwork>::latest_message_version();
+
+    // Message 1: the cleartext hint.
+    let hint = messages::HandshakeHint { version, listener_port: 5000, node_type, address: account.address() };
+    noise.send(&hint.to_bytes_le().unwrap()).await?;
+
+    // Message 2: the client's metadata, if it is still talking to us at all.
+    let Ok(peer_info) = noise.recv().await else {
+        return Ok(None);
+    };
+    let peer_info = messages::PeerInfo::<CurrentNetwork>::from_bytes_le(&peer_info).unwrap();
+
+    // Message 3: our metadata and the proof of our identity.
+    let binding = binding_message(messages::HANDSHAKE_DOMAIN, Role::Initiator, &noise.handshake_hash()?);
+    let signature = account.sign_bytes(&binding, &mut rand::rng()).unwrap();
+    let our_info = messages::PeerInfo::new(
+        5000,
+        node_type,
+        account.address(),
+        peer_info.genesis_header,
+        restrictions_id.unwrap_or(peer_info.restrictions_id),
+        None,
+    );
+    let our_message = messages::InitiatorInfo { info: our_info, signature: Data::Object(signature) };
+    noise.send(&our_message.to_bytes_le().unwrap()).await?;
+
+    // Message 4: the verdict.
+    let mut noise = noise.into_transport_mode()?;
+    let verdict = messages::ResponderProof::from_bytes_le(&noise.recv().await?).unwrap();
+
+    Ok(Some((verdict, noise)))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_completes_a_router_mode_noise_handshake_with_a_bootstrap_client() {
+    let client = new_test_bootstrap_client().await;
+    let rng = &mut TestRng::default();
+    let peer = Account::<CurrentNetwork>::new(rng).unwrap();
+
+    let verdict = router_handshake_with(&client, &peer, NodeType::Client, None).await.unwrap();
+
+    let Some((messages::ResponderProof::Accepted { signature }, _session)) = verdict else {
+        panic!("expected the handshake to be accepted");
+    };
+    assert!(signature.deserialize_blocking().is_ok());
+
+    // And it must have registered the peer in Router mode, under the node type it authenticated.
+    let client_ = client.clone();
+    let address = peer.address();
+    deadline!(Duration::from_secs(5), move || {
+        client_.get_connected_peers().iter().any(|peer| peer.aleo_addr == address && peer.node_type == NodeType::Client)
+    });
+}
+
+/// The defect this handshake exists to close, seen from the bootstrap client: declaring `Prover` no
+/// longer skips the restrictions check.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bootstrap_client_rejects_a_spoofed_prover_in_router_mode() {
+    let client = new_test_bootstrap_client().await;
+    let rng = &mut TestRng::default();
+    let peer = Account::<CurrentNetwork>::new(rng).unwrap();
+
+    let wrong = Field::<CurrentNetwork>::from_str("1field").unwrap();
+    let verdict = router_handshake_with(&client, &peer, NodeType::Prover, Some(wrong)).await.unwrap();
+
+    assert!(
+        matches!(verdict, Some((messages::ResponderProof::Rejected { .. }, _)) | None),
+        "the bootstrap client accepted a prover with a mismatched restrictions ID"
+    );
+    let address = peer.address();
+    assert!(!client.get_connected_peers().iter().any(|peer| peer.aleo_addr == address));
 }

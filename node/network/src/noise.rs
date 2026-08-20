@@ -86,8 +86,9 @@ pub const HANDSHAKE_HASH_LEN: usize = 32;
 /// payload would need.
 ///
 /// Note that this is a soft parameter of the wire protocol: raising it later is harmless, lowering
-/// it is not, so it is set with headroom rather than as tightly as today's messages allow.
-const MAX_HANDSHAKE_MSG_LEN: usize = 1024;
+/// it is not, so it is set with headroom rather than as tightly as today's messages allow. It is
+/// public so that a caller adding a field to a payload can pin that it still fits.
+pub const MAX_HANDSHAKE_MSG_LEN: usize = 1024;
 
 // The handshake limit only means anything if it is the tighter of the two; a change that inverted
 // them would otherwise widen what an unchecked peer can ask for, silently.

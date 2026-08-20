@@ -187,9 +187,11 @@ const NOISE_HANDSHAKE_ACTIVATION: Option<ConsensusVersion> = Some(ConsensusVersi
 ///
 /// It must trail [`NOISE_HANDSHAKE_ACTIVATION`] by enough for every peer to have switched, as a
 /// validator that has not yet reached the activation still dials with the legacy handshake and would
-/// be shut out. Note also that the same relay is reachable through the router's handshake, which
-/// signs a byte-identical message with the same account key, so the gateway cannot be the last part
-/// of this to be converted.
+/// be shut out. Note also that the same relay is reachable through the router's *legacy* handshake,
+/// which signs a byte-identical message with the same account key: the router now has a Noise
+/// handshake of its own, under its own binding domain, but until its legacy path expires too - see
+/// `LEGACY_HANDSHAKE_EXPIRY` in `node/router/src/handshake.rs` - closing this one does not close
+/// that route.
 const LEGACY_HANDSHAKE_EXPIRY: Option<ConsensusVersion> = Some(ConsensusVersion::V21);
 
 /// Part of the Gateway API that deals with networking.

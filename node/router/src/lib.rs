@@ -138,6 +138,13 @@ pub struct InnerRouter<N: Network> {
     node_data_dir: NodeDataDir,
     /// The boolean flag for the development mode.
     is_dev: bool,
+    /// Pins which handshake this node offers when it dials, bypassing the activation height.
+    ///
+    /// Tests default to the Noise handshake, since that is the one under test, and set this to
+    /// `false` to cover the other half of the transition: a converted node has to keep talking to
+    /// unconverted ones, which means the legacy path must stay exercised for as long as it exists.
+    #[cfg(any(test, feature = "test"))]
+    initiates_noise_handshake: std::sync::atomic::AtomicBool,
 }
 
 impl<N: Network> Router<N> {
@@ -195,6 +202,8 @@ impl<N: Network> Router<N> {
             trusted_peers_only,
             node_data_dir,
             is_dev,
+            #[cfg(any(test, feature = "test"))]
+            initiates_noise_handshake: std::sync::atomic::AtomicBool::new(true),
         })))
     }
 }

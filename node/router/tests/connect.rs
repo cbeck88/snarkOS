@@ -18,7 +18,6 @@ use common::*;
 
 use snarkos_node_network::PeerPoolHandling;
 use snarkos_node_tcp::{
-    ConnectError,
     P2P,
     protocols::{Disconnect, Handshake, OnConnect},
 };
@@ -110,10 +109,13 @@ async fn test_connect_with_handshake() {
     {
         // Connect node0 to node1.
         let _ = node0.connect(node1.local_ip());
-        // Await for node1 to be connected.
+        // Await for both nodes to be connected. Waiting on the responder alone is not enough under
+        // the Noise handshake: it registers the peer the moment it sends its verdict, while the
+        // initiator is still verifying the proof that came back with it.
         let node0_ip = node0.local_ip();
-        let node1_ = node1.clone();
-        deadline!(Duration::from_secs(5), move || { node1_.is_connected(node0_ip) });
+        let node1_ip = node1.local_ip();
+        let (node0_, node1_) = (node0.clone(), node1.clone());
+        deadline!(Duration::from_secs(5), move || { node1_.is_connected(node0_ip) && node0_.is_connected(node1_ip) });
 
         print_tcp!(node0);
         print_tcp!(node1);
@@ -198,10 +200,13 @@ async fn test_validator_connection() {
     {
         // Connect node0 to node1.
         let _ = node0.connect(node1.local_ip());
-        // Await for node1 to be connected.
+        // Await for both nodes to be connected. Waiting on the responder alone is not enough under
+        // the Noise handshake: it registers the peer the moment it sends its verdict, while the
+        // initiator is still verifying the proof that came back with it.
         let node0_ip = node0.local_ip();
-        let node1_ = node1.clone();
-        deadline!(Duration::from_secs(5), move || { node1_.is_connected(node0_ip) });
+        let node1_ip = node1.local_ip();
+        let (node0_, node1_) = (node0.clone(), node1.clone());
+        deadline!(Duration::from_secs(5), move || { node1_.is_connected(node0_ip) && node0_.is_connected(node1_ip) });
 
         print_tcp!(node0);
         print_tcp!(node1);
@@ -228,12 +233,11 @@ async fn test_validator_connection() {
         // Connect node1 to node0.
         let res = node1.connect(node0.local_ip()).unwrap().await.unwrap();
 
-        assert!(
-            matches!(res, Err(ConnectError::Other { .. })),
-            "Connection was accepted or incorrect error was returned"
-        );
-
-        assert!(res.unwrap_err().to_string().contains("no external peers allowed"));
+        // The connection must be refused. Note that the initiator is not told why: node0 turns the
+        // peer away before the Noise pattern has begun, which is the point of checking there - a
+        // peer it would never accept costs it no key derivation - but leaves it with no channel to
+        // answer over. The legacy handshake could say, having a codec from the first byte.
+        assert!(res.is_err(), "Connection was accepted");
 
         // Check the TCP level - connection was not accepted.
         assert_eq!(node0.tcp().num_connected(), 0);
