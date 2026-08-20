@@ -60,6 +60,11 @@ impl<N: Network> LedgerService<N> for ProverLedgerService<N> {
     }
 
     /// Returns the latest restrictions ID in the ledger.
+    ///
+    /// A prover has no ledger, so there is nothing to read this from. Nothing calls it either: it
+    /// exists for the gateway's handshake, and a prover does not run one. The value a prover
+    /// discloses during the router's handshake is loaded from the network's compile-time restrictions
+    /// list instead; see `Prover::restrictions_id`.
     fn latest_restrictions_id(&self) -> Field<N> {
         Field::zero()
     }

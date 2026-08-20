@@ -30,7 +30,6 @@ use snarkos_node_tcp::{ConnectError, Connection, ConnectionSide, Tcp, connection
 use snarkvm::{
     console::network::{ConsensusVersion, Network},
     ledger::block::Transaction,
-    prelude::{Field, Zero},
     utilities::into_io_error,
 };
 
@@ -54,7 +53,12 @@ impl<N: Network, C: ConsensusStorage<N>> Handshake for Prover<N, C> {
         // Make the socket more robust.
         harden_socket(stream)?;
         let genesis_header = *self.genesis.header();
-        let restrictions_id = Field::zero(); // Provers may bypass restrictions, since they do not validate transactions.
+        // A prover discloses the same restrictions ID as everybody else. It has no ledger to read
+        // one from, but the restrictions list is a compile-time constant of the network, so the
+        // value is loaded once at startup; see `Prover::restrictions_id`. Sending a real one is what
+        // lets the check that reads it apply to provers as well - the exemption in the router's
+        // legacy handshake only ever existed because this used to be zero.
+        let restrictions_id = self.restrictions_id;
 
         self.router
             .handshake(peer_addr, stream, conn_side, genesis_header, restrictions_id)

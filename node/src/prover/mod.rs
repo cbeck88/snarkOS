@@ -41,12 +41,13 @@ use snarkvm::{
     console::network::consensus_config_value,
     ledger::narwhal::Data,
     prelude::{
+        Field,
         Network,
         block::{Block, Header},
         puzzle::{Puzzle, Solution},
         store::ConsensusStorage,
     },
-    synthesizer::VM,
+    synthesizer::{Restrictions, VM},
 };
 
 use anyhow::Result;
@@ -76,6 +77,14 @@ pub struct Prover<N: Network, C: ConsensusStorage<N>> {
     sync: Arc<BlockSync<N>>,
     /// The genesis block.
     genesis: Block<N>,
+    /// The restrictions ID of the network.
+    ///
+    /// A prover has no ledger to read this from, but it does not need one: the restrictions list is
+    /// a compile-time constant of the network, so loading it here yields exactly the value a
+    /// validator or client derives from `VM::restrictions`. It is loaded once, as parsing the list
+    /// is not free, and disclosed during the handshake so that a prover is held to the same
+    /// restrictions check as everybody else.
+    restrictions_id: Field<N>,
     /// The puzzle.
     puzzle: Puzzle<N>,
     /// The latest epoch hash.
@@ -133,11 +142,14 @@ impl<N: Network, C: ConsensusStorage<N>> Prover<N, C> {
 
         // Compute the maximum number of puzzle instances.
         let max_puzzle_instances = num_cpus::get().saturating_sub(2).clamp(1, 6);
+        // Load the restrictions ID.
+        let restrictions_id = Restrictions::<N>::load()?.restrictions_id();
         // Initialize the node.
         let node = Self {
             router,
             sync: Arc::new(sync),
             genesis,
+            restrictions_id,
             puzzle: VM::<N, C>::new_puzzle()?,
             latest_epoch_hash: Default::default(),
             latest_block_header: Default::default(),
