@@ -141,6 +141,11 @@ impl<N: Network> Message<N> {
         (ConsensusVersion::V21, 32),
     ];
 
+    /// The maximum size of a `PuzzleResponse` or `UnconfirmedSolution` message. Both wrap a
+    /// fixed-size payload (a block header, or a puzzle solution) with no legitimate reason to
+    /// approach `MAXIMUM_MESSAGE_SIZE`, so they are capped far below it.
+    pub(crate) const MAX_PUZZLE_OR_SOLUTION_MESSAGE_SIZE: usize = 8 * 1024; // 8 KiB
+
     /// Returns the latest message version.
     pub fn latest_message_version() -> u32 {
         Self::VERSIONS.last().map(|(_, version)| *version).unwrap_or(0)
@@ -230,6 +235,13 @@ impl<N: Network> Message<N> {
         // SPECIAL CASE: check the transaction message isn't too large.
         if id == 12 && len > N::LATEST_MAX_TRANSACTION_SIZE() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "transaction is too large"))?;
+        }
+
+        // SPECIAL CASE: PuzzleResponse and UnconfirmedSolution carry a fixed-size header or
+        // solution respectively, so unlike a transaction they have no legitimate reason to
+        // approach the general frame size limit; cap them far below it.
+        if (id == 10 || id == 11) && len > Self::MAX_PUZZLE_OR_SOLUTION_MESSAGE_SIZE {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "puzzle or solution message is too large"))?;
         }
 
         Ok(())

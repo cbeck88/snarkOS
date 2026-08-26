@@ -95,7 +95,11 @@ mod tests {
     use super::*;
 
     use crate::{
+        PuzzleResponse,
+        UnconfirmedSolution,
         UnconfirmedTransaction,
+        puzzle_response::prop_tests::any_large_puzzle_response,
+        unconfirmed_solution::prop_tests::any_large_unconfirmed_solution,
         unconfirmed_transaction::prop_tests::{any_large_unconfirmed_transaction, any_unconfirmed_transaction},
     };
 
@@ -119,6 +123,24 @@ mod tests {
         let mut bytes = BytesMut::new();
         let mut codec = MessageCodec::<CurrentNetwork>::default();
         assert!(codec.encode(Message::UnconfirmedTransaction(tx), &mut bytes).is_ok());
+        assert!(matches!(codec.decode(&mut bytes), Err(err) if err.kind() == std::io::ErrorKind::InvalidData));
+    }
+
+    #[proptest(ProptestConfig { cases : 10, ..ProptestConfig::default() })]
+    fn overly_large_puzzle_response(#[strategy(any_large_puzzle_response())] message: PuzzleResponse<CurrentNetwork>) {
+        let mut bytes = BytesMut::new();
+        let mut codec = MessageCodec::<CurrentNetwork>::default();
+        assert!(codec.encode(Message::PuzzleResponse(message), &mut bytes).is_ok());
+        assert!(matches!(codec.decode(&mut bytes), Err(err) if err.kind() == std::io::ErrorKind::InvalidData));
+    }
+
+    #[proptest(ProptestConfig { cases : 10, ..ProptestConfig::default() })]
+    fn overly_large_unconfirmed_solution(
+        #[strategy(any_large_unconfirmed_solution())] solution: UnconfirmedSolution<CurrentNetwork>,
+    ) {
+        let mut bytes = BytesMut::new();
+        let mut codec = MessageCodec::<CurrentNetwork>::default();
+        assert!(codec.encode(Message::UnconfirmedSolution(solution), &mut bytes).is_ok());
         assert!(matches!(codec.decode(&mut bytes), Err(err) if err.kind() == std::io::ErrorKind::InvalidData));
     }
 }
