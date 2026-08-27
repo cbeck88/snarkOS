@@ -110,8 +110,9 @@ impl<N: Network> Ping<N> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz-helpers"))]
 pub mod prop_tests {
+    #![cfg_attr(not(test), allow(unused_imports))]
     use crate::{MAX_PING_LOCATOR_HEIGHT, Ping, challenge_request::prop_tests::any_node_type};
     use snarkos_node_sync_locators::{BlockLocators, test_helpers::sample_block_locators};
     use snarkvm::utilities::{FromBytes, ToBytes};
