@@ -99,8 +99,9 @@ impl<N: Network> Ping<N> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz-helpers"))]
 pub mod prop_tests {
+    #![cfg_attr(not(test), allow(unused_imports))]
     use crate::{Ping, challenge_request::prop_tests::any_node_type};
     use snarkos_node_sync_locators::{
         BlockLocators,

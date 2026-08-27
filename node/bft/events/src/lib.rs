@@ -337,8 +337,9 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz-helpers"))]
 pub mod prop_tests {
+    #![cfg_attr(not(test), allow(unused_imports))]
     use crate::{
         Disconnect,
         DisconnectReason,
