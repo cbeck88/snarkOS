@@ -20,6 +20,8 @@ use crate::{
     Gateway,
     MAX_BATCH_DELAY,
     MAX_LEADER_CERTIFICATE_DELAY,
+    MAX_PARALLEL_PROPOSAL_CHECKS,
+    MAX_PROPOSAL_CHECK_TIMEOUT,
     MAX_WORKERS,
     MIN_BATCH_DELAY,
     PRIMARY_PING_INTERVAL,
@@ -70,7 +72,10 @@ use snarkvm::{
 };
 
 use anyhow::Context;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::{
+    TryStreamExt,
+    stream::{FuturesUnordered, StreamExt},
+};
 use indexmap::{IndexMap, IndexSet};
 #[cfg(feature = "locktick")]
 use locktick::{
@@ -1030,6 +1035,20 @@ impl<N: Network> Primary<N> {
             return Ok(());
         };
 
+        // Check the transactions the batch names that are not yet in storage, whether just fetched from
+        // the peer or already held by a worker (a transaction fetched on a worker ping is unverified),
+        // and refuse to sign if any fails or the checks time out. A certificate commits every
+        // validator to the transactions it names, so nothing is signed that this node has not checked.
+        // Note: Solutions are checked for well-formedness only (above); checking them here is a separate change.
+        if let Err(err) = self.check_transactions_before_signing(&missing_transmissions).await {
+            // The peer is not penalized: an honest proposer may hold a different view of the ledger.
+            warn!(
+                "Refusing to sign the batch proposal for round {batch_round} from '{peer_ip}' ({batch_author}) - {}",
+                flatten_error(err)
+            );
+            return Ok(());
+        }
+
         // Inserts the missing transmissions into the workers.
         self.insert_missing_transmissions_into_workers(peer_ip, missing_transmissions.into_iter())?;
 
@@ -1845,6 +1864,48 @@ impl<N: Network> Primary<N> {
         Ok(())
     }
 
+    /// Checks every transaction among the given transmissions with the ledger, at most
+    /// `MAX_PARALLEL_PROPOSAL_CHECKS` at a time, and returns an error naming the first transmission
+    /// that fails, or an error if the checks do not all complete within `MAX_PROPOSAL_CHECK_TIMEOUT`.
+    ///
+    /// This is the full `check_transaction_basic` (proofs included), not only the fee check: a copy
+    /// of a transaction with a malleated execution proof keeps its ID and a valid fee. A transaction
+    /// that arrived by gossip was checked at the worker, and one checked for an earlier proposal is a
+    /// hit in the VM's verification cache, which skips the proof checks. One fetched on a worker ping,
+    /// or for this proposal, is checked here for the first time, which is the latency this check adds.
+    async fn check_transactions_before_signing(
+        &self,
+        transmissions: &HashMap<TransmissionID<N>, Transmission<N>>,
+    ) -> Result<()> {
+        // Build a check for each transaction; see `process_batch_propose_from_peer` for solutions.
+        let checks = transmissions.iter().filter_map(|(transmission_id, transmission)| {
+            let (TransmissionID::Transaction(transaction_id, _), Transmission::Transaction(transaction)) =
+                (*transmission_id, transmission)
+            else {
+                return None;
+            };
+            let (ledger, transmission_id, transaction) = (self.ledger.clone(), *transmission_id, transaction.clone());
+            let context = move || format!("transaction '{}' failed the check", fmt_id(transmission_id));
+            Some(async move {
+                // `ensure_transmission_is_well_formed` has deserialized it; a buffer is deserialized here.
+                let transaction = match transaction {
+                    Data::Object(transaction) => transaction,
+                    buffer => spawn_blocking!(deserialize_transaction_strict(buffer)).with_context(context)?,
+                };
+                ledger.check_transaction_basic(transaction_id, transaction).await.with_context(context)
+            })
+        });
+        // Collect first: the borrowing iterator, held across the await, would make this future not `Send`.
+        let checks = checks.collect::<Vec<_>>();
+        // Run the checks, returning on the first failure or once the timeout elapses.
+        tokio::time::timeout(
+            MAX_PROPOSAL_CHECK_TIMEOUT,
+            futures::stream::iter(checks).buffer_unordered(MAX_PARALLEL_PROPOSAL_CHECKS).try_collect::<()>(),
+        )
+        .await
+        .map_err(|_| anyhow!("timed out after {MAX_PROPOSAL_CHECK_TIMEOUT:?} checking the transactions"))?
+    }
+
     /// Inserts the missing transmissions from the proposal into the workers.
     fn insert_missing_transmissions_into_workers(
         &self,
@@ -1898,6 +1959,9 @@ impl<N: Network> Primary<N> {
         }
 
         // If the peer is ahead, use the batch header to sync up to the peer.
+        // Note: Unlike a batch proposal (see `process_batch_propose_from_peer`), the transactions of a
+        // certificate are not checked here: the certificate carries a quorum of signatures, and each
+        // signer checked the transactions before signing.
         let missing_transmissions = self.sync_with_batch_header_from_peer::<false>(peer_ip, batch_header).await?;
 
         // Store the batch certificate. The same certificate can reach this point from several
