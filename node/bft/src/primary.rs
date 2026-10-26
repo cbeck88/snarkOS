@@ -2296,6 +2296,15 @@ mod tests {
         height: u32,
     ) -> Primary<CurrentNetwork> {
         let ledger = Arc::new(MockLedgerService::new_at_height(committee, height));
+        primary_with_ledger(account_index, accounts, ledger)
+    }
+
+    // Returns a primary over the given mock ledger.
+    fn primary_with_ledger(
+        account_index: usize,
+        accounts: &[(SocketAddr, Account<CurrentNetwork>)],
+        ledger: Arc<MockLedgerService<CurrentNetwork>>,
+    ) -> Primary<CurrentNetwork> {
         let storage = Storage::new(ledger.clone(), Arc::new(BFTMemoryService::new()), 10).unwrap();
 
         // Initialize the primary.
@@ -2320,6 +2329,52 @@ mod tests {
         }
 
         primary
+    }
+
+    // Returns a round-1 proposal from the committee member at index 1, with one solution and the given
+    // number of transactions, after handing its transmissions to the primary's worker and making its
+    // author known to the resolver, along with the author's IP and address.
+    fn peer_proposal_for_primary(
+        primary: &Primary<CurrentNetwork>,
+        accounts: &[(SocketAddr, Account<CurrentNetwork>)],
+        num_transactions: u64,
+        rng: &mut TestRng,
+    ) -> (Proposal<CurrentNetwork>, SocketAddr, Address<CurrentNetwork>) {
+        let (peer_ip, peer_account) = &accounts[1];
+        let timestamp = now() + MIN_BATCH_DELAY.as_secs() as i64;
+        let proposal = create_test_proposal(
+            peer_account,
+            primary.ledger.current_committee().unwrap(),
+            1,
+            Default::default(),
+            timestamp,
+            num_transactions,
+            rng,
+        );
+
+        // Make sure the primary is aware of the transmissions in the proposal.
+        for (transmission_id, transmission) in proposal.transmissions() {
+            primary.workers()[0].process_transmission_from_peer(*peer_ip, *transmission_id, transmission.clone())
+        }
+
+        // The author must be known to resolver to pass propose checks.
+        primary.gateway.resolver().write().insert_peer(*peer_ip, *peer_ip, Some(peer_account.address()));
+
+        (proposal, *peer_ip, peer_account.address())
+    }
+
+    // Returns the IDs of the transactions in the given proposal.
+    fn proposal_transaction_ids(
+        proposal: &Proposal<CurrentNetwork>,
+    ) -> Vec<<CurrentNetwork as Network>::TransactionID> {
+        proposal
+            .transmissions()
+            .keys()
+            .filter_map(|transmission_id| match transmission_id {
+                TransmissionID::Transaction(transaction_id, _) => Some(*transaction_id),
+                _ => None,
+            })
+            .collect()
     }
 
     fn primary_without_handlers(
@@ -2756,36 +2811,80 @@ mod tests {
     async fn test_batch_propose_from_peer() {
         let mut rng = TestRng::default();
         let (primary, accounts) = primary_without_handlers(&mut rng);
-
-        // Create a valid proposal with an author that isn't the primary.
-        let round = 1;
-        let peer_account = &accounts[1];
-        let peer_ip = peer_account.0;
-        let timestamp = now() + MIN_BATCH_DELAY.as_secs() as i64;
-        let proposal = create_test_proposal(
-            &peer_account.1,
-            primary.ledger.current_committee().unwrap(),
-            round,
-            Default::default(),
-            timestamp,
-            1,
-            &mut rng,
-        );
-
-        // Make sure the primary is aware of the transmissions in the proposal.
-        for (transmission_id, transmission) in proposal.transmissions() {
-            primary.workers()[0].process_transmission_from_peer(peer_ip, *transmission_id, transmission.clone())
-        }
-
-        // The author must be known to resolver to pass propose checks.
-        primary.gateway.resolver().write().insert_peer(peer_ip, peer_ip, Some(peer_account.1.address()));
+        let (proposal, peer_ip, peer_address) = peer_proposal_for_primary(&primary, &accounts, 1, &mut rng);
 
         // Try to process the batch proposal from the peer, should succeed.
         assert!(
             primary.process_batch_propose_from_peer(peer_ip, (*proposal.batch_header()).clone().into()).await.is_ok()
         );
         // The primary signed the proposal.
-        assert!(primary.signed_proposals.read().get(&peer_account.1.address()).is_some());
+        assert!(primary.signed_proposals.read().get(&peer_address).is_some());
+    }
+
+    /// A proposal naming a transaction that fails the ledger's check is not signed, and the proposer
+    /// is neither disconnected nor remembered as signed for the round, so a later proposal from it
+    /// for the same round can still be signed.
+    #[test_log::test(tokio::test)]
+    async fn test_batch_propose_from_peer_with_an_invalid_transaction() {
+        let mut rng = TestRng::default();
+        let (accounts, committee) = sample_committee(&mut rng);
+        let height = CurrentNetwork::CONSENSUS_HEIGHT(ConsensusVersion::V1).unwrap();
+        let ledger = Arc::new(MockLedgerService::new_at_height(committee, height));
+        let primary = primary_with_ledger(0, &accounts, ledger.clone());
+        let (proposal, peer_ip, peer_address) = peer_proposal_for_primary(&primary, &accounts, 1, &mut rng);
+        let [transaction_id] = proposal_transaction_ids(&proposal)[..] else { panic!("expected one transaction") };
+        assert!(primary.gateway.is_connected(peer_ip));
+
+        // The transaction fails the check: the proposal is refused without an error, and nothing is signed.
+        ledger.fail_transaction(transaction_id);
+        primary.process_batch_propose_from_peer(peer_ip, (*proposal.batch_header()).clone().into()).await.unwrap();
+        assert!(primary.signed_proposals.read().get(&peer_address).is_none());
+        // The proposer is not penalized.
+        assert!(primary.gateway.is_connected(peer_ip));
+
+        // Once the transaction passes, the same proposal is signed.
+        ledger.pass_transaction(transaction_id);
+        primary.process_batch_propose_from_peer(peer_ip, (*proposal.batch_header()).clone().into()).await.unwrap();
+        assert!(primary.signed_proposals.read().get(&peer_address).is_some());
+    }
+
+    /// A proposal with several transactions, exactly one of which fails the ledger's check, is not signed.
+    #[test_log::test(tokio::test)]
+    async fn test_batch_propose_from_peer_with_one_invalid_transaction_among_several() {
+        let mut rng = TestRng::default();
+        let (accounts, committee) = sample_committee(&mut rng);
+        let height = CurrentNetwork::CONSENSUS_HEIGHT(ConsensusVersion::V1).unwrap();
+        let ledger = Arc::new(MockLedgerService::new_at_height(committee, height));
+        let primary = primary_with_ledger(0, &accounts, ledger.clone());
+        let (proposal, peer_ip, peer_address) = peer_proposal_for_primary(&primary, &accounts, 4, &mut rng);
+        let transaction_ids = proposal_transaction_ids(&proposal);
+        assert_eq!(transaction_ids.len(), 4);
+
+        // One transaction fails the check: the proposal is refused without an error, and nothing is signed.
+        ledger.fail_transaction(transaction_ids[2]);
+        primary.process_batch_propose_from_peer(peer_ip, (*proposal.batch_header()).clone().into()).await.unwrap();
+        assert!(primary.signed_proposals.read().get(&peer_address).is_none());
+        assert!(primary.gateway.is_connected(peer_ip));
+    }
+
+    /// A proposal whose transaction checks do not complete within `MAX_PROPOSAL_CHECK_TIMEOUT` is not signed.
+    #[test_log::test(tokio::test(start_paused = true))]
+    async fn test_batch_propose_from_peer_with_a_hanging_transaction_check() {
+        let mut rng = TestRng::default();
+        let (accounts, committee) = sample_committee(&mut rng);
+        let height = CurrentNetwork::CONSENSUS_HEIGHT(ConsensusVersion::V1).unwrap();
+        let ledger = Arc::new(MockLedgerService::new_at_height(committee, height));
+        let primary = primary_with_ledger(0, &accounts, ledger.clone());
+        let (proposal, peer_ip, peer_address) = peer_proposal_for_primary(&primary, &accounts, 1, &mut rng);
+        let [transaction_id] = proposal_transaction_ids(&proposal)[..] else { panic!("expected one transaction") };
+
+        // The check never completes: the handler returns once the timeout elapses, and nothing is signed.
+        ledger.hang_transaction(transaction_id);
+        let start = tokio::time::Instant::now();
+        primary.process_batch_propose_from_peer(peer_ip, (*proposal.batch_header()).clone().into()).await.unwrap();
+        assert!(start.elapsed() >= MAX_PROPOSAL_CHECK_TIMEOUT);
+        assert!(primary.signed_proposals.read().get(&peer_address).is_none());
+        assert!(primary.gateway.is_connected(peer_ip));
     }
 
     /// A transmission that storage knows only as aborted still has to be fetched from the peer:

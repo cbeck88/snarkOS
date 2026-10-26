@@ -45,12 +45,40 @@ pub struct MockLedgerService<N: Network> {
     /// The transmission IDs the ledger knows without being able to produce a transmission for them,
     /// as is the case for the ones it recorded as aborted.
     known_transmission_ids: HashSet<TransmissionID<N>>,
+    /// The transaction IDs whose `check_transaction_basic` fails.
+    failing_transaction_ids: Mutex<HashSet<N::TransactionID>>,
+    /// The transaction IDs whose `check_transaction_basic` never completes.
+    hanging_transaction_ids: Mutex<HashSet<N::TransactionID>>,
 }
 
 impl<N: Network> MockLedgerService<N> {
     /// Initializes a new mock ledger service.
     pub fn new(committee: Committee<N>) -> Self {
-        Self { committee, height_to_round_and_hash: Default::default(), known_transmission_ids: Default::default() }
+        Self {
+            committee,
+            height_to_round_and_hash: Default::default(),
+            known_transmission_ids: Default::default(),
+            failing_transaction_ids: Default::default(),
+            hanging_transaction_ids: Default::default(),
+        }
+    }
+
+    /// Makes `check_transaction_basic` fail for the given transaction.
+    pub fn fail_transaction(&self, transaction_id: N::TransactionID) {
+        self.hanging_transaction_ids.lock().remove(&transaction_id);
+        self.failing_transaction_ids.lock().insert(transaction_id);
+    }
+
+    /// Makes `check_transaction_basic` never complete for the given transaction.
+    pub fn hang_transaction(&self, transaction_id: N::TransactionID) {
+        self.failing_transaction_ids.lock().remove(&transaction_id);
+        self.hanging_transaction_ids.lock().insert(transaction_id);
+    }
+
+    /// Makes `check_transaction_basic` pass for the given transaction (the default).
+    pub fn pass_transaction(&self, transaction_id: N::TransactionID) {
+        self.failing_transaction_ids.lock().remove(&transaction_id);
+        self.hanging_transaction_ids.lock().remove(&transaction_id);
     }
 
     /// Initializes a new mock ledger service at the specified height.
@@ -63,6 +91,8 @@ impl<N: Network> MockLedgerService<N> {
             committee,
             height_to_round_and_hash: Mutex::new(height_to_hash),
             known_transmission_ids: Default::default(),
+            failing_transaction_ids: Default::default(),
+            hanging_transaction_ids: Default::default(),
         }
     }
 
@@ -74,7 +104,13 @@ impl<N: Network> MockLedgerService<N> {
         committee: Committee<N>,
         known_transmission_ids: HashSet<TransmissionID<N>>,
     ) -> Self {
-        Self { committee, height_to_round_and_hash: Default::default(), known_transmission_ids }
+        Self {
+            committee,
+            height_to_round_and_hash: Default::default(),
+            known_transmission_ids,
+            failing_transaction_ids: Default::default(),
+            hanging_transaction_ids: Default::default(),
+        }
     }
 }
 
@@ -228,12 +264,22 @@ impl<N: Network> LedgerService<N> for MockLedgerService<N> {
         Ok(())
     }
 
-    /// Checks the given transaction is well-formed and unique.
+    /// Checks the given transaction: it fails if set by [`Self::fail_transaction`], never completes
+    /// if set by [`Self::hang_transaction`], and passes otherwise.
     async fn check_transaction_basic(
         &self,
         transaction_id: N::TransactionID,
         _transaction: Transaction<N>,
     ) -> Result<()> {
+        // Read the sets before awaiting, so that no lock is held across the await below.
+        if self.failing_transaction_ids.lock().contains(&transaction_id) {
+            trace!("[MockLedgerService] Check transaction basic {:?} - Fail", fmt_id(transaction_id));
+            bail!("[MockLedgerService] Transaction {} is invalid", fmt_id(transaction_id))
+        }
+        if self.hanging_transaction_ids.lock().contains(&transaction_id) {
+            trace!("[MockLedgerService] Check transaction basic {:?} - Hang", fmt_id(transaction_id));
+            return std::future::pending().await;
+        }
         trace!("[MockLedgerService] Check transaction basic {:?} - Ok", fmt_id(transaction_id));
         Ok(())
     }
