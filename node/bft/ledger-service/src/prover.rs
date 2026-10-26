@@ -168,6 +168,21 @@ impl<N: Network> LedgerService<N> for ProverLedgerService<N> {
         Ok(())
     }
 
+    /// Checks the fee of the given transaction.
+    async fn check_fee(&self, _transaction: Transaction<N>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Returns `true` if the ledger contains the given serial number.
+    fn contains_serial_number(&self, serial_number: &Field<N>) -> Result<bool> {
+        bail!("Serial number '{serial_number}' does not exist in prover")
+    }
+
+    /// Returns `true` if the ledger contains the given transaction ID.
+    fn contains_transaction_id(&self, transaction_id: &N::TransactionID) -> Result<bool> {
+        bail!("Transaction '{transaction_id}' does not exist in prover")
+    }
+
     fn check_block_subdag(
         &self,
         _block: Block<N>,
