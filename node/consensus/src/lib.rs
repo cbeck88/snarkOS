@@ -451,7 +451,7 @@ impl<N: Network> Consensus<N> {
                     return Err(err);
                 }
             };
-            // Check the fee.
+            // Check the fee, or the whole transaction if it has none.
             self.ledger.check_fee(transaction.clone()).await?;
             // Add the transaction to the memory pool, with its callback.
             let height = self.ledger.latest_block_height();
@@ -492,14 +492,16 @@ impl<N: Network> Consensus<N> {
     }
 
     /// Checks, before any proof work, that the memory pool would admit the given transaction and that
-    /// none of its lock keys is pending, and returns them. A serial number key must also not be spent
-    /// in the ledger. The check of a pending key is repeated when the transaction is queued, and the
-    /// queue insert decides capacity again.
+    /// none of its lock keys is pending, and returns them. A fee's serial number key must also not be
+    /// spent in the ledger (the full check covers a transaction without a fee). The check of a pending
+    /// key is repeated when the transaction is queued, and the queue insert decides capacity again.
     ///
     /// The fee itself is checked next, by the ledger: the fee proof and its binding to the deployment
     /// or execution, the base fee against the cost, the maximum fee, the payer's balance, and the fee's
-    /// global state root; the deployment or execution proof is left to the BFT worker. The checks run on
-    /// untrusted bytes, so the ledger runs them on a blocking thread and reports a panic as a failure.
+    /// global state root; the deployment or execution proof is left to the BFT worker. A transaction
+    /// without a fee is checked in full instead, so the VM decides whether it is exempt (a lone
+    /// `credits.aleo/split` or `credits.aleo/upgrade`). The checks run on untrusted bytes, so the ledger
+    /// runs them on a blocking thread and reports a panic as a failure.
     fn check_inputs_at_admission(&self, transaction: &Transaction<N>, priority_fee: U64<N>) -> Result<Vec<LockKey<N>>> {
         let transaction_id = transaction.id();
         // Determine the lock keys.
@@ -517,10 +519,12 @@ impl<N: Network> Consensus<N> {
             self.release_settled_locks(&tx_queue, &mut input_locks, &lock_keys)?;
             input_locks.check(&lock_keys)?;
         }
-        // Ensure the consumed record, if any, is not already spent in the ledger.
-        for serial_number in lock_keys.iter().filter_map(LockKey::serial_number) {
-            if self.ledger.contains_serial_number(serial_number)? {
-                bail!("Transaction '{}' spends a record that is already spent", fmt_id(transaction_id));
+        // Ensure the record the fee consumes, if any, is not already spent in the ledger.
+        if transaction.fee_transition().is_some() {
+            for serial_number in lock_keys.iter().filter_map(LockKey::serial_number) {
+                if self.ledger.contains_serial_number(serial_number)? {
+                    bail!("Transaction '{}' spends a record that is already spent", fmt_id(transaction_id));
+                }
             }
         }
         Ok(lock_keys)
