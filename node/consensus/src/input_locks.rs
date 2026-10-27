@@ -68,8 +68,11 @@ mod tests {
     }
 
     /// Samples a `credits.aleo/transfer_public` from the genesis account to a random address, paying
-    /// a private fee from a genesis record if `is_fee_private`, and a public fee otherwise.
-    fn sample_transfer_public_transaction(is_fee_private: bool, rng: &mut TestRng) -> Transaction<CurrentNetwork> {
+    /// a public fee from `fee_payer` if given, and a private fee from a genesis record otherwise.
+    fn sample_transfer_public_transaction(
+        fee_payer: Option<&PrivateKey<CurrentNetwork>>,
+        rng: &mut TestRng,
+    ) -> Transaction<CurrentNetwork> {
         let (block, transactions, private_key) = sample_genesis_block_and_components(rng);
         let process = Process::load().unwrap();
         let block_store = BlockStore::<CurrentNetwork, BlockMemory<_>>::open(StorageMode::new_test(None)).unwrap();
@@ -95,17 +98,17 @@ mod tests {
 
         // The fee.
         let (base_fee, priority_fee) = (10_000_000, 1_000);
-        let authorization = match is_fee_private {
-            true => {
+        let authorization = match fee_payer {
+            None => {
                 let record = transactions.iter().next().unwrap().records().next().unwrap().1.clone();
                 let record = record.decrypt(&ViewKey::try_from(&private_key).unwrap()).unwrap();
                 process
                     .authorize_fee_private::<AleoV0, _>(&private_key, record, base_fee, priority_fee, execution_id, rng)
                     .unwrap()
             }
-            false => process
-                .authorize_fee_public::<AleoV0, _>(&private_key, base_fee, priority_fee, execution_id, rng)
-                .unwrap(),
+            Some(fee_payer) => {
+                process.authorize_fee_public::<AleoV0, _>(fee_payer, base_fee, priority_fee, execution_id, rng).unwrap()
+            }
         };
         let (_, mut trace) = process.execute::<AleoV0, _>(authorization, rng).unwrap();
         trace.prepare(&query).unwrap();
@@ -123,14 +126,12 @@ mod tests {
         let fee = transaction.fee_transition().unwrap();
         assert_eq!(LockKey::from_transaction(&transaction).unwrap(), vec![LockKey::Payer(fee.payer().unwrap())]);
 
-        // A private fee locks the serial number of its record, then the address the sampled execution (a
-        // genesis `credits.aleo` call from the genesis account) debits.
+        // A private fee locks the serial number of its record, and nothing else: the sampled execution
+        // (a `credits.aleo` call from the genesis account) adds no key.
         let transaction = sample_execution_transaction_with_fee(true, rng, 0);
         let fee = transaction.fee_transition().unwrap();
-        let mut keys = fee.serial_numbers().map(|sn| LockKey::SerialNumber(*sn)).collect::<Vec<_>>();
+        let keys = fee.serial_numbers().map(|sn| LockKey::SerialNumber(*sn)).collect::<Vec<_>>();
         assert_eq!(keys.len(), 1);
-        let (_, _, private_key) = sample_genesis_block_and_components(rng);
-        keys.push(LockKey::Payer(Address::try_from(&private_key).unwrap()));
         assert_eq!(LockKey::from_transaction(&transaction).unwrap(), keys);
 
         // A deployment's fee locks the same way.
@@ -164,25 +165,27 @@ mod tests {
         assert!(locks.check(&keys).is_err());
     }
 
-    /// A transaction that debits a public balance takes that address's key as well as its fee's key,
-    /// so a private-fee `transfer_public` cannot drain an address while a public-fee transaction from
-    /// it is pending; a public-fee `transfer_public` from the payer takes the one key once.
+    /// The address a `credits.aleo/transfer_public` debits is no key: a transaction's keys are its
+    /// fee's alone, so one paid by another address than the sender has exactly one key, the payer.
     #[test]
-    fn a_public_debit_widens_the_keys() {
+    fn a_public_debit_is_not_a_key() {
         let rng = &mut TestRng::default();
-        let (_, _, private_key) = sample_genesis_block_and_components(rng);
-        let sender = LockKey::Payer(Address::try_from(&private_key).unwrap());
+        let (_, _, genesis_key) = sample_genesis_block_and_components(rng);
+        let sender = LockKey::Payer(Address::try_from(&genesis_key).unwrap());
 
-        // A private fee: the record's serial number, then the debited address.
-        let transaction = sample_transfer_public_transaction(true, rng);
+        // A private fee: the record's serial number only.
+        let transaction = sample_transfer_public_transaction(None, rng);
         let fee = transaction.fee_transition().unwrap();
         assert!(!fee.is_fee_public());
         let serial_number = LockKey::SerialNumber(*fee.serial_numbers().next().unwrap());
-        assert_eq!(LockKey::from_transaction(&transaction).unwrap(), vec![serial_number, sender]);
+        assert_eq!(LockKey::from_transaction(&transaction).unwrap(), vec![serial_number]);
 
-        // A public fee from the same address: the key is taken once.
-        let transaction = sample_transfer_public_transaction(false, rng);
+        // A public fee paid by another address: the payer only, not the sender.
+        let payer_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
+        let payer = LockKey::Payer(Address::try_from(&payer_key).unwrap());
+        assert_ne!(payer, sender);
+        let transaction = sample_transfer_public_transaction(Some(&payer_key), rng);
         assert!(transaction.fee_transition().unwrap().is_fee_public());
-        assert_eq!(LockKey::from_transaction(&transaction).unwrap(), vec![sender]);
+        assert_eq!(LockKey::from_transaction(&transaction).unwrap(), vec![payer]);
     }
 }

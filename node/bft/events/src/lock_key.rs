@@ -15,48 +15,39 @@
 
 use super::*;
 
-use snarkvm::{
-    console::program::{Argument, Literal, Plaintext},
-    ledger::block::Transaction,
-};
+use snarkvm::ledger::block::Transaction;
 
-/// The `credits.aleo` functions whose finalize debits a public balance, with the position of the
-/// debited address among the arguments of the future each of them outputs.
-///
-/// Every one of these takes the debited address as a public input of its finalize, so the address
-/// is visible in the plaintext of the transition's future output without executing it. `bond_public`,
-/// `bond_validator` and `unbond_public` move credits between an account and its bond rather than out
-/// of an account, but each still reduces a public balance of the listed address.
-const DEBITING_FUNCTIONS: [(&str, usize); 7] = [
-    ("transfer_public", 0),
-    ("transfer_public_as_signer", 0),
-    ("transfer_public_to_private", 0),
-    ("bond_public", 0),
-    ("bond_validator", 0),
-    ("unbond_public", 1),
-    ("fee_public", 0),
-];
-
-/// A lock key of a transaction: an input it spends, visible in its plaintext.
+/// A lock key of a transaction: an input it spends, visible in its plaintext and bound to its signer.
 ///
 /// At most one pending transaction per key is admitted to the memory pool, and at most one is lock-signed.
+///
+/// A key must be one that only the transaction's signer could take, because every validator takes
+/// it in the lock round after `check_transaction_basic` alone, before finalize ever runs. The payer
+/// of a public fee is (`fee_public` debits `self.signer`), and so is a serial number (consuming the
+/// record needs its owner's key). The address a `credits.aleo` call debits is not, so it is no key:
+/// `transfer_public`, `bond_public`, `unbond_public` and `transfer_public_to_private` pass
+/// `self.caller` to finalize, which is the calling program's address when another program calls
+/// them, so every user of such a program would share one key and anyone could hold the program's
+/// lock for one fee per block; and `unbond_public` debits the staker, whom the signer need not
+/// control (the withdrawal-address check is in finalize), so anyone could hold a validator's lock
+/// for one fee per block. A race on a non-fee public debit ends in a rejection with the fee paid,
+/// not an abort, so nothing the locks are for is lost by leaving it out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LockKey<N: Network> {
-    /// A public address whose balance the transaction debits: the payer of a public fee, or the
-    /// debited address of a `credits.aleo` call (see [`DEBITING_FUNCTIONS`]).
+    /// The payer of a public fee.
     Payer(Address<N>),
     /// The serial number of a record consumed by a private fee, or by a transaction without a fee.
     SerialNumber(Field<N>),
 }
 
 impl<N: Network> LockKey<N> {
-    /// Returns the lock keys of the given transaction, without duplicates: the key of its fee, then
-    /// the public address debited by each `credits.aleo` call among its transitions.
+    /// Returns the lock keys of the given transaction: the payer of its public fee, or the serial
+    /// numbers its private fee consumes.
     ///
     /// The keys of a transaction without a fee are the serial numbers of the records it consumes; whether
     /// it is exempt from the fee is left to the VM's full check. One that consumes no record is refused.
     pub fn from_transaction(transaction: &Transaction<N>) -> Result<Vec<Self>> {
-        let mut keys = match transaction.fee_transition() {
+        let keys = match transaction.fee_transition() {
             Some(fee) => match (fee.is_fee_public(), fee.payer()) {
                 (true, Some(payer)) => vec![Self::Payer(payer)],
                 (true, None) => bail!("Transaction '{}' has a public fee without a payer", transaction.id()),
@@ -65,32 +56,6 @@ impl<N: Network> LockKey<N> {
             None => transaction.serial_numbers().map(|serial_number| Self::SerialNumber(*serial_number)).collect(),
         };
         ensure!(!keys.is_empty(), "Transaction '{}' has no lock key", transaction.id());
-        // Widen to every public address the transaction debits through `credits.aleo`.
-        for transition in transaction.transitions().filter(|transition| transition.is_credits()) {
-            let function_name = transition.function_name().to_string();
-            let Some((_, index)) = DEBITING_FUNCTIONS.iter().find(|(name, _)| *name == function_name) else {
-                continue;
-            };
-            let Some(future) = transition.outputs().iter().find_map(|output| output.future()) else {
-                bail!("Transition '{}' of transaction '{}' outputs no future", transition.id(), transaction.id());
-            };
-            ensure!(
-                future.program_id().to_string() == "credits.aleo"
-                    && future.function_name().to_string() == function_name,
-                "Transition '{}' of transaction '{}' outputs a future of another function",
-                transition.id(),
-                transaction.id()
-            );
-            let Some(Argument::Plaintext(Plaintext::Literal(Literal::Address(address), _))) =
-                future.arguments().get(*index)
-            else {
-                bail!("Transition '{}' of transaction '{}' has no debited address", transition.id(), transaction.id());
-            };
-            let key = Self::Payer(*address);
-            if !keys.contains(&key) {
-                keys.push(key);
-            }
-        }
         Ok(keys)
     }
 
