@@ -385,15 +385,6 @@ impl<N: Network> Worker<N> {
         if !is_well_formed {
             return;
         }
-        // If the transmission is a deserialized execution, capture it so it can be verified
-        // immediately below (only if it is actually inserted). This takes heavy transaction
-        // verification out of the hot path during block generation.
-        let execution_to_verify = match (transmission_id, &transmission) {
-            (TransmissionID::Transaction(tx_id, _), Transmission::Transaction(Data::Object(tx))) if tx.is_execute() => {
-                Some((tx_id, tx.clone()))
-            }
-            _ => None,
-        };
         // Insert the transmission into the ready queue. When the capacity limit is enforced, the
         // check is performed atomically with the insertion (i.e. under a single write lock), so that
         // concurrent inserts cannot collectively exceed `MAX_TRANSMISSIONS_PER_WORKER`.
@@ -407,13 +398,6 @@ impl<N: Network> Worker<N> {
         };
         // If the transmission was newly inserted, then process it further.
         if inserted {
-            // Eagerly verify a newly-inserted execution to warm the verification cache.
-            if let Some((tx_id, tx)) = execution_to_verify {
-                let self_ = self.clone();
-                tokio::spawn(async move {
-                    let _ = self_.ledger.check_transaction_basic(tx_id, tx).await;
-                });
-            }
             trace!(
                 "Worker {} - Added transmission '{}' from '{peer_ip}'",
                 self.id,
