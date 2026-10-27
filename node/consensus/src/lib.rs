@@ -16,7 +16,7 @@
 #![forbid(unsafe_code)]
 
 mod transactions_queue;
-use transactions_queue::TransactionsQueue;
+use transactions_queue::{Queued, TransactionsQueue};
 
 #[macro_use]
 extern crate tracing;
@@ -390,7 +390,16 @@ impl<N: Network> Consensus<N> {
 
     /// Adds the given unconfirmed transaction to the memory pool, which will then eventually be passed
     /// to the BFT layer for inclusion in a batch.
-    pub async fn add_unconfirmed_transaction(&self, transaction: Transaction<N>) -> Result<()> {
+    ///
+    /// The callback runs once the BFT worker has checked the transaction and added it to its ready
+    /// queue, so the caller may propagate the transaction. It is dropped if the transaction was
+    /// recently seen, is evicted from the queue, or fails the check. An evicted transaction is
+    /// forgotten by the seen cache, so it can be resubmitted.
+    pub async fn add_unconfirmed_transaction(
+        &self,
+        transaction: Transaction<N>,
+        on_verified: impl FnOnce() + Send + Sync + 'static,
+    ) -> Result<()> {
         // Calculate the transmission checksum.
         let checksum = Data::<Transaction<N>>::Buffer(transaction.to_bytes_le()?.into()).to_checksum::<N>()?;
         // Queue the unconfirmed transaction.
@@ -414,9 +423,20 @@ impl<N: Network> Consensus<N> {
             if self.contains_transaction(&transaction_id) {
                 bail!("Transaction '{}' exists in the memory pool", fmt_id(transaction_id));
             }
-            // Add the transaction to the memory pool.
+            // Add the transaction to the memory pool, with its callback.
             let priority_fee = transaction.priority_fee_amount()?;
-            self.transactions_queue.write().insert(transaction_id, transaction, priority_fee)?;
+            let evicted = self.transactions_queue.write().insert(
+                transaction_id,
+                transaction,
+                priority_fee,
+                Box::new(on_verified),
+            )?;
+            // Forget an evicted transaction, so it can be resubmitted: the queue dropped it, callback
+            // included, before it was checked. A transaction that failed the check, or that the BFT
+            // already had, stays seen.
+            if let Some(evicted) = evicted {
+                self.seen_transactions.lock().pop(&evicted);
+            }
             #[cfg(feature = "metrics")]
             {
                 metrics::increment_gauge(metrics::consensus::UNCONFIRMED_TRANSACTIONS, 1f64);
@@ -460,7 +480,7 @@ impl<N: Network> Consensus<N> {
                         if select_deployment { tx_queue.deployments.pop() } else { tx_queue.executions.pop() }
                     },
                 )
-                .map(|(_, tx)| tx)
+                .map(|(_, queued)| queued)
                 .collect_vec();
             #[cfg(feature = "metrics")]
             {
@@ -484,7 +504,7 @@ impl<N: Network> Consensus<N> {
             transactions
         };
         // Iterate over the transactions.
-        for transaction in transactions.into_iter() {
+        for Queued { transaction, on_verified } in transactions {
             let transaction_id = transaction.id();
             // Determine the type of the transaction. The fee type is technically not possible here.
             let tx_type_str = match transaction {
@@ -493,9 +513,9 @@ impl<N: Network> Consensus<N> {
                 Transaction::Fee(..) => "fee",
             };
             trace!("Adding unconfirmed {tx_type_str} transaction '{}' to the memory pool...", fmt_id(transaction_id));
-            // Send the unconfirmed transaction to the primary.
+            // Send the unconfirmed transaction to the primary, and run the callback once it is verified.
             match self.primary_sender.send_unconfirmed_transaction(transaction_id, Data::Object(transaction)).await {
-                Ok(true) => {}
+                Ok(true) => on_verified(),
                 Ok(false) => debug!(
                     "Unable to add unconfirmed {tx_type_str} transaction '{}' to the memory pool. Already exists.",
                     fmt_id(transaction_id)
