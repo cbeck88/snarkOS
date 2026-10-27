@@ -179,6 +179,21 @@ impl<N: Network, C: ConsensusStorage<N>> LedgerService<N> for TranslucentLedgerS
         Ok(())
     }
 
+    /// Always succeeds.
+    async fn check_fee(&self, _transaction: Transaction<N>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Returns `true` if the ledger contains the given serial number.
+    fn contains_serial_number(&self, serial_number: &Field<N>) -> Result<bool> {
+        self.inner.contains_serial_number(serial_number)
+    }
+
+    /// Returns `true` if the ledger contains the given transaction ID.
+    fn contains_transaction_id(&self, transaction_id: &N::TransactionID) -> Result<bool> {
+        self.inner.contains_transaction_id(transaction_id)
+    }
+
     fn check_block_subdag(
         &self,
         _block: Block<N>,

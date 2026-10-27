@@ -54,6 +54,16 @@ impl<N: Network> TransactionsQueue<N> {
         self.executions.contains(transaction_id) || self.deployments.contains(transaction_id)
     }
 
+    /// Returns `true` if a new transaction of the given kind and priority fee would be admitted by
+    /// [`Self::insert`] now: the queue has room, or the transaction has a priority fee that is at
+    /// least the lowest queued one (and may evict). This mirrors `insert` without mutating the queue.
+    pub fn would_admit(&self, is_execute: bool, priority_fee: U64<N>) -> bool {
+        match is_execute {
+            true => self.executions.would_admit(priority_fee),
+            false => self.deployments.would_admit(priority_fee),
+        }
+    }
+
     /// Inserts the transaction, returning the ID of the transaction it evicted (if any).
     pub fn insert(
         &mut self,
@@ -126,6 +136,18 @@ impl<N: Network> TransactionsQueueInner<N> {
             .iter()
             .chain(self.fifo_queue.iter())
             .map(|(id, queued)| (*id, queued.transaction.clone()))
+    }
+
+    /// Returns `true` if a new transaction with the given priority fee would be admitted (see `insert`).
+    fn would_admit(&self, priority_fee: U64<N>) -> bool {
+        if self.len() < self.capacity {
+            return true;
+        }
+        match (self.priority_queue.len() < self.capacity, *priority_fee) {
+            (_, 0) => false,
+            (true, _) => true,
+            (false, _) => self.priority_queue.would_admit(priority_fee),
+        }
     }
 
     /// Inserts the transaction, returning the ID of the transaction it evicted (if any).
@@ -239,6 +261,11 @@ impl<N: Network> PriorityQueue<N> {
             // Increment the counter.
             self.counter += 1;
         }
+    }
+
+    /// Returns `true` if `compare_insert` would accept the given fee.
+    fn would_admit(&self, fee: U64<N>) -> bool {
+        self.transaction_ids.last_key_value().is_none_or(|((Reverse(lowest_fee), _), _)| *lowest_fee <= fee)
     }
 
     /// Inserts the transaction if its fee beats the lowest queued fee, returning the ID of the
@@ -507,6 +534,47 @@ mod tests {
         assert_eq!(executions_queue.pop_transaction().unwrap(), executions[2]);
         assert_eq!(executions_queue.pop_transaction().unwrap(), executions[3]);
         assert!(executions_queue.pop_transaction().is_none());
+    }
+
+    #[test]
+    fn would_admit_mirrors_insert() {
+        let mut rng = TestRng::default();
+
+        let executions: Vec<_> = (0..8)
+            .map(|_| {
+                let execution_transaction = sample_execution_transaction_with_fee(false, &mut rng, 0);
+                (execution_transaction.id(), execution_transaction)
+            })
+            .collect();
+        // Checks that `would_admit` predicts the outcome of `insert`.
+        let check = |queue: &mut TransactionsQueueInner<CurrentNetwork>, i: usize, fee: u64| {
+            let expected = queue.would_admit(U64::new(fee));
+            let len = queue.len();
+            let admitted = queue.insert(executions[i].0, executions[i].1.clone(), U64::new(fee), noop()).is_ok();
+            assert_eq!(expected, admitted, "fee {fee} at length {len}");
+        };
+
+        // Not full: any fee is admitted.
+        let mut queue = TransactionsQueueInner::new(3);
+        check(&mut queue, 0, 0);
+        check(&mut queue, 1, 100);
+        check(&mut queue, 2, 0);
+        // Full, with zero-fee transactions: a zero fee is refused, a priority fee evicts.
+        check(&mut queue, 3, 0);
+        check(&mut queue, 3, 50);
+        check(&mut queue, 4, 200);
+        // Full of priority transactions (50, 100, 200): a fee below the lowest is refused, an equal one evicts.
+        assert_eq!(queue.priority_queue.len(), 3);
+        check(&mut queue, 5, 0);
+        check(&mut queue, 5, 49);
+        check(&mut queue, 5, 50);
+        check(&mut queue, 6, 300);
+        assert_eq!(queue.len(), 3);
+
+        // The outer queue routes by kind: a full execution queue does not refuse a deployment.
+        let transactions_queue = TransactionsQueue::<CurrentNetwork> { executions: queue, ..Default::default() };
+        assert!(!transactions_queue.would_admit(true, U64::new(0)));
+        assert!(transactions_queue.would_admit(false, U64::new(0)));
     }
 
     #[test]

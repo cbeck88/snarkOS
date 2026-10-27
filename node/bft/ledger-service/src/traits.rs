@@ -147,6 +147,20 @@ pub trait LedgerService<N: Network>: std::fmt::Debug + Send + Sync {
         transaction: Transaction<N>,
     ) -> Result<()>;
 
+    /// Checks the fee of the given transaction: the fee proof and its binding to the deployment or
+    /// execution, the base fee against the cost, the maximum fee, the public payer's confirmed balance,
+    /// and the fee's global state root. The deployment or execution itself is not checked.
+    ///
+    /// A transaction without a fee is checked in full, as by [`Self::check_transaction_basic`], so the
+    /// VM decides whether it is exempt from the fee.
+    async fn check_fee(&self, transaction: Transaction<N>) -> Result<()>;
+
+    /// Returns `true` if the ledger contains the given serial number.
+    fn contains_serial_number(&self, serial_number: &Field<N>) -> Result<bool>;
+
+    /// Returns `true` if the ledger contains the given transaction ID, confirmed (accepted or rejected) or aborted.
+    fn contains_transaction_id(&self, transaction_id: &N::TransactionID) -> Result<bool>;
+
     /// Start a transactional update to the ledger.
     ///
     /// Note: This may block and should only be called from a blocking task.

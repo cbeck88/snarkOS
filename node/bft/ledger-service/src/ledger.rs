@@ -516,6 +516,29 @@ impl<N: Network, C: ConsensusStorage<N>> LedgerService<N> for CoreLedgerService<
         spawn_blocking!(ledger.check_transaction_basic(&transaction, None, &mut rand::rng()))
     }
 
+    /// Checks the fee of the given transaction, or the whole transaction if it has no fee.
+    ///
+    /// The check runs on a blocking thread; a panic in the verifier surfaces as an error.
+    async fn check_fee(&self, transaction: Transaction<N>) -> Result<()> {
+        // A transaction without a fee is checked in full: the VM applies its own fee exemption.
+        if transaction.fee_transition().is_none() {
+            return self.check_transaction_basic(transaction.id(), transaction).await;
+        }
+        // Check the fee.
+        let ledger = self.ledger.clone();
+        spawn_blocking!(ledger.vm().check_fee(&transaction, None, false))
+    }
+
+    /// Returns `true` if the ledger contains the given serial number.
+    fn contains_serial_number(&self, serial_number: &Field<N>) -> Result<bool> {
+        self.ledger.contains_serial_number(serial_number)
+    }
+
+    /// Returns `true` if the ledger contains the given transaction ID, confirmed (accepted or rejected) or aborted.
+    fn contains_transaction_id(&self, transaction_id: &N::TransactionID) -> Result<bool> {
+        self.ledger.contains_transaction_id(transaction_id)
+    }
+
     fn check_block_subdag(
         &self,
         block: Block<N>,

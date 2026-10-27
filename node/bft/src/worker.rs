@@ -735,6 +735,9 @@ mod tests {
                 transaction_id: N::TransactionID,
                 transaction: Transaction<N>,
             ) -> Result<()>;
+            async fn check_fee(&self, transaction: Transaction<N>) -> Result<()>;
+            fn contains_serial_number(&self, serial_number: &Field<N>) -> Result<bool>;
+            fn contains_transaction_id(&self, transaction_id: &N::TransactionID) -> Result<bool>;
             fn check_block_subdag(&self, _block: Block<N>, _prefix: &[PendingBlock<N>]) -> Result<PendingBlock<N>, CheckBlockError<N>>;
             fn begin_ledger_update<'a>(&'a self) -> Result<Box<dyn LedgerUpdateService<N> + 'a>, BeginLedgerUpdateError>;
             fn transaction_spend_in_microcredits(&self, transaction: &Transaction<N>, consensus_version: ConsensusVersion) -> Result<u64>;

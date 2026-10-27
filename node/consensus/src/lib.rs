@@ -15,6 +15,8 @@
 
 #![forbid(unsafe_code)]
 
+mod input_locks;
+use input_locks::{InputLocks, LockKey};
 mod transactions_queue;
 use transactions_queue::{Queued, TransactionsQueue};
 
@@ -112,6 +114,8 @@ pub struct Consensus<N: Network> {
     seen_solutions: Arc<Mutex<LruCache<SolutionID<N>, ()>>>,
     /// The recently-seen unconfirmed transactions.
     seen_transactions: Arc<Mutex<LruCache<N::TransactionID, ()>>>,
+    /// The lock keys of the admitted transactions that are not yet settled in a block.
+    input_locks: Arc<Mutex<InputLocks<N>>>,
     #[cfg(feature = "metrics")]
     transmissions_tracker: Arc<Mutex<HashMap<TransmissionID<N>, i64>>>,
     /// The spawned handles.
@@ -129,6 +133,11 @@ pub struct Consensus<N: Network> {
 }
 
 impl<N: Network> Consensus<N> {
+    /// The age in blocks past which a lock expires, unless its transaction is still queued.
+    /// Note: A transmission the BFT does not commit within `MAX_GC_ROUNDS` rounds is garbage-collected,
+    /// and a block spans at least one round, so a lock this many blocks old cannot settle in a block.
+    const MAX_LOCK_AGE: u32 = BatchHeader::<N>::MAX_GC_ROUNDS as u32;
+
     /// Initializes a new instance of consensus.
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -177,6 +186,7 @@ impl<N: Network> Consensus<N> {
             transactions_queue: Default::default(),
             seen_solutions: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(1 << 16).unwrap()))),
             seen_transactions: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(1 << 16).unwrap()))),
+            input_locks: Default::default(),
             #[cfg(feature = "metrics")]
             transmissions_tracker: Default::default(),
             handles: Default::default(),
@@ -391,9 +401,17 @@ impl<N: Network> Consensus<N> {
     /// Adds the given unconfirmed transaction to the memory pool, which will then eventually be passed
     /// to the BFT layer for inclusion in a batch.
     ///
+    /// The fee is checked and the payer's lock key taken before the transaction is queued (see
+    /// [`Self::check_inputs_at_admission`] and [`LockKey`]), so a transaction cannot displace another
+    /// from the queue on a fee that is invalid, and one payer holds at most one queued transaction at a
+    /// time. A valid fee attached to an invalid deployment or execution can still be queued; it fails
+    /// the BFT worker's full check, fee included, when it is dequeued, without being charged (checking
+    /// transactions before signing a batch, and charging rejected transactions, address this).
+    ///
     /// The callback runs once the BFT worker has checked the transaction and added it to its ready
     /// queue, so the caller may propagate the transaction. It is dropped if the transaction was
-    /// recently seen, is evicted from the queue, or fails the check. An evicted transaction is
+    /// recently seen, is refused or evicted from the queue, or fails the check. A transaction refused
+    /// before any proof work (the pool is full, or a lock key is pending or spent), or evicted, is
     /// forgotten by the seen cache, so it can be resubmitted.
     pub async fn add_unconfirmed_transaction(
         &self,
@@ -423,19 +441,40 @@ impl<N: Network> Consensus<N> {
             if self.contains_transaction(&transaction_id) {
                 bail!("Transaction '{}' exists in the memory pool", fmt_id(transaction_id));
             }
-            // Add the transaction to the memory pool, with its callback.
+            // Before any proof work, check the pool's capacity and the lock keys. A transaction refused here
+            // is forgotten by the seen cache, so it can be resubmitted.
             let priority_fee = transaction.priority_fee_amount()?;
-            let evicted = self.transactions_queue.write().insert(
-                transaction_id,
-                transaction,
-                priority_fee,
-                Box::new(on_verified),
-            )?;
-            // Forget an evicted transaction, so it can be resubmitted: the queue dropped it, callback
-            // included, before it was checked. A transaction that failed the check, or that the BFT
-            // already had, stays seen.
-            if let Some(evicted) = evicted {
-                self.seen_transactions.lock().pop(&evicted);
+            let lock_keys = match self.check_inputs_at_admission(&transaction, priority_fee) {
+                Ok(lock_keys) => lock_keys,
+                Err(err) => {
+                    self.seen_transactions.lock().pop(&transaction_id);
+                    return Err(err);
+                }
+            };
+            // Check the fee, or the whole transaction if it has none.
+            self.ledger.check_fee(transaction.clone()).await?;
+            // Add the transaction to the memory pool, with its callback.
+            let height = self.ledger.latest_block_height();
+            {
+                let mut tx_queue = self.transactions_queue.write();
+                let mut input_locks = self.input_locks.lock();
+                // Refuse a key that became pending since the check at admission (forgetting the transaction in
+                // the seen cache, as above), then queue the transaction and take its locks.
+                let free = self.release_settled_locks(&tx_queue, &mut input_locks, &lock_keys);
+                if let Err(err) = free.and_then(|()| input_locks.check(&lock_keys)) {
+                    self.seen_transactions.lock().pop(&transaction_id);
+                    return Err(err);
+                }
+                let evicted = tx_queue.insert(transaction_id, transaction, priority_fee, Box::new(on_verified))?;
+                // The keys were checked under the same guards, and a transaction holding locks has its keys pending.
+                input_locks.insert(transaction_id, lock_keys, height).expect("the lock keys were checked above");
+                // Drop the locks of the evicted transaction, if any (the queue dropped its callback), and
+                // forget it in the seen cache, so it can be resubmitted: it was never checked. A transaction
+                // that failed the check, or that the BFT already had, stays seen.
+                if let Some(evicted) = evicted {
+                    input_locks.remove(&evicted);
+                    self.seen_transactions.lock().pop(&evicted);
+                }
             }
             #[cfg(feature = "metrics")]
             {
@@ -450,6 +489,66 @@ impl<N: Network> Consensus<N> {
 
         // Try to process the unconfirmed transactions in the memory pool.
         self.process_unconfirmed_transactions().await
+    }
+
+    /// Checks, before any proof work, that the memory pool would admit the given transaction and that
+    /// none of its lock keys is pending, and returns them. A fee's serial number key must also not be
+    /// spent in the ledger (the full check covers a transaction without a fee). The check of a pending
+    /// key is repeated when the transaction is queued, and the queue insert decides capacity again.
+    ///
+    /// The fee itself is checked next, by the ledger: the fee proof and its binding to the deployment
+    /// or execution, the base fee against the cost, the maximum fee, the payer's balance, and the fee's
+    /// global state root; the deployment or execution proof is left to the BFT worker. A transaction
+    /// without a fee is checked in full instead, so the VM decides whether it is exempt (a lone
+    /// `credits.aleo/split` or `credits.aleo/upgrade`). The checks run on untrusted bytes, so the ledger
+    /// runs them on a blocking thread and reports a panic as a failure.
+    fn check_inputs_at_admission(&self, transaction: &Transaction<N>, priority_fee: U64<N>) -> Result<Vec<LockKey<N>>> {
+        let transaction_id = transaction.id();
+        // Determine the lock keys.
+        let lock_keys = LockKey::from_transaction(transaction)?;
+        {
+            let tx_queue = self.transactions_queue.read();
+            // Ensure the memory pool would admit the transaction.
+            if !tx_queue.would_admit(transaction.is_execute(), priority_fee) {
+                #[cfg(feature = "metrics")]
+                metrics::increment_counter(metrics::consensus::DROPPED_TRANSACTIONS);
+                bail!("The memory pool is full");
+            }
+            // Ensure no key is pending, before the ledger lookup and the proof check.
+            let mut input_locks = self.input_locks.lock();
+            self.release_settled_locks(&tx_queue, &mut input_locks, &lock_keys)?;
+            input_locks.check(&lock_keys)?;
+        }
+        // Ensure the record the fee consumes, if any, is not already spent in the ledger.
+        if transaction.fee_transition().is_some() {
+            for serial_number in lock_keys.iter().filter_map(LockKey::serial_number) {
+                if self.ledger.contains_serial_number(serial_number)? {
+                    bail!("Transaction '{}' spends a record that is already spent", fmt_id(transaction_id));
+                }
+            }
+        }
+        Ok(lock_keys)
+    }
+
+    /// Drops the stale locks in the way of the given keys: the locks older than [`Self::MAX_LOCK_AGE`]
+    /// blocks, if the height moved since the last expiry (sparing the transactions still in `tx_queue`),
+    /// and the locks of a transaction holding one of the keys that the ledger already contains, confirmed
+    /// or aborted. The latter covers a block applied by BFT block sync, which does not pass through
+    /// [`Self::try_advance_to_next_block`], and a block that settled the transaction before it took its locks.
+    fn release_settled_locks(
+        &self,
+        tx_queue: &TransactionsQueue<N>,
+        input_locks: &mut InputLocks<N>,
+        keys: &[LockKey<N>],
+    ) -> Result<()> {
+        let height = self.ledger.latest_block_height();
+        input_locks.expire_if_height_moved(height, Self::MAX_LOCK_AGE, |id| tx_queue.contains(id));
+        for holder in input_locks.holders(keys) {
+            if self.ledger.contains_transaction_id(&holder)? {
+                input_locks.remove(&holder);
+            }
+        }
+        Ok(())
     }
 
     /// Processes unconfirmed transactions in the mempool, and passes them to the BFT layer
@@ -521,6 +620,8 @@ impl<N: Network> Consensus<N> {
                     fmt_id(transaction_id)
                 ),
                 Err(err) => {
+                    // A transaction that failed the check will not reach a block, so its locks are cleared.
+                    self.input_locks.lock().remove(&transaction_id);
                     // If the BFT is synced, then log the warning.
                     if self.bft.is_synced() {
                         let err = err.context(format!(
@@ -737,6 +838,24 @@ impl<N: Network> Consensus<N> {
 
         // Make block sync aware of the new block.
         self.block_sync.set_sync_height(block_height);
+
+        // Clear the locks of the transactions in the block, confirmed (accepted or rejected) or aborted,
+        // then expire the stale locks (see `MAX_LOCK_AGE`), sparing the transactions still queued.
+        'locks: {
+            let tx_queue = self.transactions_queue.read();
+            let mut input_locks = self.input_locks.lock();
+            if input_locks.is_empty() {
+                break 'locks;
+            }
+            for transaction in block.transactions().iter() {
+                let transaction_id = transaction.to_unconfirmed_transaction_id().unwrap_or_else(|_| transaction.id());
+                input_locks.remove(&transaction_id);
+            }
+            for transaction_id in block.aborted_transaction_ids() {
+                input_locks.remove(transaction_id);
+            }
+            input_locks.expire(block_height, Self::MAX_LOCK_AGE, |id| tx_queue.contains(id));
+        }
 
         // TODO(kaimast): This should also remove any transmissions/solutions contained in the block from the mempool.
         // Removal currently happens when Consensus eventually passes them to the worker, which then just discards them.
