@@ -29,6 +29,8 @@ pub use snarkos_node_bft_events as events;
 pub use snarkos_node_bft_ledger_service as ledger_service;
 pub use snarkos_node_bft_storage_service as storage_service;
 
+use snarkvm::prelude::{CanaryV0, MainnetV0, Network, TestnetV0};
+
 use std::time::Duration;
 
 pub mod helpers;
@@ -80,6 +82,30 @@ pub const MAX_PROPOSAL_CHECK_TIMEOUT: Duration = Duration::from_millis(2 * (MAX_
 /// from here, and neither fits a mixed batch; 8 bounds the blocking threads a proposal of up to 50 transmissions
 /// holds in proof verification at once, and a batch of cache hits still completes in a few rounds.
 pub const MAX_PARALLEL_PROPOSAL_CHECKS: usize = 8;
+
+/// The maximum time the originator of a lock round waits for a quorum of lock signatures (see `LockCertificate`).
+/// A responder runs the same full check a batch proposal gets, under the same `MAX_PROPOSAL_CHECK_TIMEOUT` budget,
+/// so this is that budget: a transaction takes well under a second to check, which leaves room for the round trip;
+/// and it is below `MAX_FETCH_TIMEOUT`, so a transaction's lock round never outlasts a fetch of it.
+pub const MAX_LOCK_ROUND_TIMEOUT: Duration = Duration::from_millis(2 * (MAX_BATCH_DELAY.as_millis() as u64));
+
+/// The block height on a dev network, and in tests, from which lock certificates are required.
+pub const LOCK_CERTIFICATE_DEV_HEIGHT: u32 = 10;
+
+/// The block height from which lock certificates are required, per network ID; `u32::MAX` is unscheduled.
+const LOCK_CERTIFICATE_HEIGHTS: [(u16, u32); 3] =
+    [(MainnetV0::ID, u32::MAX), (TestnetV0::ID, u32::MAX), (CanaryV0::ID, u32::MAX)];
+
+/// Returns the block height from which lock certificates are required: a transaction is proposed only with one,
+/// and a batch proposal naming a transaction without a valid one is not signed (see `LockCertificate`).
+/// Lock rounds run at every height; only the requirement is scheduled (see `LOCK_CERTIFICATE_HEIGHTS`). It is
+/// `LOCK_CERTIFICATE_DEV_HEIGHT` on a dev network and in tests.
+pub fn lock_certificate_height<N: Network>(dev: Option<u16>) -> u32 {
+    if dev.is_some() || cfg!(test) {
+        return LOCK_CERTIFICATE_DEV_HEIGHT;
+    }
+    LOCK_CERTIFICATE_HEIGHTS.iter().find(|(id, _)| *id == N::ID).map_or(u32::MAX, |(_, height)| *height)
+}
 
 /// The maximum time allowed for the leader to send their certificate.
 /// After this time, the node will consider the leader as failed and try to advance the round without it.
