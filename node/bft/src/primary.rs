@@ -20,6 +20,7 @@ use crate::{
     Gateway,
     MAX_BATCH_DELAY,
     MAX_LEADER_CERTIFICATE_DELAY,
+    MAX_LOCK_ROUND_TIMEOUT,
     MAX_PARALLEL_PROPOSAL_CHECKS,
     MAX_PROPOSAL_CHECK_TIMEOUT,
     MAX_WORKERS,
@@ -29,7 +30,7 @@ use crate::{
     Transport,
     WORKER_PING_INTERVAL,
     Worker,
-    events::{BatchPropose, BatchSignature, Event},
+    events::{BatchPropose, BatchSignature, Event, LockCertificate, LockKey, LockRequest, LockResponse},
     helpers::{
         InputLocks,
         PrimaryReceiver,
@@ -1307,6 +1308,115 @@ impl<N: Network> Primary<N> {
         Ok(())
     }
 
+    /// Releases the locks of the transactions holding any of the given keys that the ledger already
+    /// contains, confirmed (accepted or rejected) or aborted. Such a transaction has settled, so even a
+    /// lock this node signed is done; and a block applied by block sync, or one that settled the
+    /// transaction before its lock was taken, does not clear its locks on block advance.
+    fn release_settled_locks(&self, input_locks: &mut InputLocks<N>, keys: &[LockKey<N>]) -> Result<()> {
+        for holder in input_locks.holders(keys) {
+            if self.ledger.contains_transaction_id(&holder)? {
+                input_locks.remove(&holder);
+            }
+        }
+        Ok(())
+    }
+
+    /// Processes a lock request from a peer: checks the transaction in full and signs a lock for it,
+    /// unless one of its keys is pending for another transaction on this node.
+    ///
+    /// This method performs the following steps:
+    /// 1. Ensure the request is signed by the peer, a committee member.
+    /// 2. Refuse if a key is pending for another transaction, before any proof work, once the locks of a
+    ///    holder the ledger already contains are released (see [`Self::release_settled_locks`]).
+    /// 3. Ensure the transaction is well-formed, its keys are the ones requested, and it passes the full check.
+    /// 4. Take the keys, sign the lock ID, and send the signature back to the peer.
+    ///
+    /// A signed lock is a promise to the committee to sign no other transaction over the same keys, so
+    /// they stay pending until the transaction settles in a block or the lock expires (see
+    /// [`InputLocks::release`]), whether or not this node ever sees the transaction again.
+    async fn process_lock_request_from_peer(&self, peer_ip: SocketAddr, lock_request: LockRequest<N>) -> Result<()> {
+        let LockRequest { transmission_id, keys, transaction, signature } = lock_request;
+
+        // Ensure the lock request is signed by the validator.
+        let signer = signature.to_address();
+        match self.gateway.resolve_to_aleo_addr(peer_ip) {
+            Some(address) if address == signer => {}
+            Some(_) => {
+                // Proceed to disconnect the validator.
+                self.gateway.disconnect(peer_ip);
+                bail!("Malicious peer - lock request is signed by a different validator ({signer})");
+            }
+            None => bail!("Lock request from a disconnected validator"),
+        }
+        // Ensure the requester is a current committee member.
+        if !self.gateway.is_authorized_validator_address(signer) {
+            // Proceed to disconnect the validator.
+            self.gateway.disconnect(peer_ip);
+            bail!("Malicious peer - lock request from a non-committee member ({signer})");
+        }
+        // Ensure the lock request is not from the current primary.
+        if self.gateway.account().address() == signer {
+            bail!("Invalid peer - lock request from myself ({signer})");
+        }
+        // Only a transaction can be locked (solutions have no lock key).
+        let TransmissionID::Transaction(transaction_id, _) = transmission_id else {
+            bail!("Lock request for a transmission that is not a transaction");
+        };
+        // Verify the requester's signature over the lock ID.
+        let lock_id = LockCertificate::<N>::lock_id(&transmission_id, &keys)?;
+        ensure!(signature.verify(&signer, &[lock_id]), "Invalid lock request signature");
+
+        // Refuse if a key is pending for another transaction, before any proof work.
+        // Note: The keys are the requester's claim at this point; they are checked against the transaction below.
+        {
+            let mut input_locks = self.input_locks.lock();
+            self.release_settled_locks(&mut input_locks, &keys)?;
+            input_locks.check_for(&transaction_id, &keys)?;
+        }
+
+        // Ensure the transaction is well-formed: it deserializes within the size limit, its ID and checksum
+        // match the transmission ID, and it is not a fee.
+        let mut transmission = Transmission::Transaction(transaction);
+        self.ledger.ensure_transmission_is_well_formed(transmission_id, &mut transmission)?;
+        let Transmission::Transaction(transaction) = transmission else {
+            unreachable!("the transmission type is fixed above")
+        };
+        let transaction = spawn_blocking!(deserialize_transaction_strict(transaction))?;
+        // Ensure the keys are the transaction's.
+        ensure!(LockKey::from_transaction(&transaction)? == keys, "Lock request keys do not match the transaction");
+
+        // Check the transaction in full (a cache hit if this node already verified it), within the time the
+        // requester waits for a quorum.
+        let check = self.ledger.check_transaction_basic(transaction_id, transaction);
+        match tokio::time::timeout(MAX_LOCK_ROUND_TIMEOUT, check).await {
+            Ok(result) => {
+                result.with_context(|| format!("transaction '{}' failed the check", fmt_id(transaction_id)))?
+            }
+            Err(_) => {
+                bail!("timed out after {MAX_LOCK_ROUND_TIMEOUT:?} checking transaction '{}'", fmt_id(transaction_id))
+            }
+        }
+
+        // Take the keys (a concurrent request may have taken one meanwhile, in which case this refuses), then sign.
+        {
+            let mut input_locks = self.input_locks.lock();
+            self.release_settled_locks(&mut input_locks, &keys)?;
+            input_locks.sign(transaction_id, keys, self.ledger.latest_block_height())?;
+        }
+        let account = self.gateway.account().clone();
+        let signature = spawn_blocking!(account.sign(&[lock_id], &mut rand::rng()))?;
+
+        // Send the signature back to the validator.
+        let self_ = self.clone();
+        self.spawn(async move {
+            let event = Event::LockResponse(LockResponse::new(transmission_id, signature));
+            if self_.gateway.send(peer_ip, event).await.is_some() {
+                debug!("Signed a lock for '{}' from '{peer_ip}'", fmt_id(transmission_id));
+            }
+        });
+        Ok(())
+    }
+
     /// Processes a batch certificate from a peer.
     ///
     /// This method performs the following steps:
@@ -1415,6 +1525,8 @@ impl<N: Network> Primary<N> {
             mut rx_batch_propose,
             mut rx_batch_signature,
             mut rx_batch_certified,
+            mut rx_lock_request,
+            rx_lock_response: _,
             mut rx_primary_ping,
             mut rx_unconfirmed_solution,
             mut rx_unconfirmed_transaction,
@@ -1576,6 +1688,24 @@ impl<N: Network> Primary<N> {
                             flatten_error(err.context(format!(
                                 "Cannot store a certificate '{id}' for round {round} from '{peer_ip}'"
                             )))
+                        );
+                    }
+                });
+            }
+        });
+
+        // Start the lock request handler.
+        let self_ = self.clone();
+        self.spawn(async move {
+            while let Some((peer_ip, lock_request)) = rx_lock_request.recv().await {
+                // Spawn a task to process the lock request: it checks the transaction in full.
+                let self__ = self_.clone();
+                self_.spawn(async move {
+                    let id = fmt_id(lock_request.transmission_id);
+                    if let Err(err) = self__.process_lock_request_from_peer(peer_ip, lock_request).await {
+                        debug!(
+                            "{}",
+                            flatten_error(err.context(format!("Not signing a lock for '{id}' from '{peer_ip}'")))
                         );
                     }
                 });
