@@ -293,14 +293,13 @@ impl<N: Network, C: ConsensusStorage<N>> Inbound<N> for Validator<N, C> {
         serialized: UnconfirmedTransaction<N>,
         transaction: Transaction<N>,
     ) -> bool {
-        // Add the unconfirmed transaction to the memory pool.
-        if let Err(error) = self.consensus.add_unconfirmed_transaction(transaction).await {
+        // Add the unconfirmed transaction to the memory pool, and propagate the "UnconfirmedTransaction"
+        // to the connected validators once the BFT worker has verified it.
+        let node = self.clone();
+        let on_verified = move || node.propagate_to_validators(Message::UnconfirmedTransaction(serialized), &[peer_ip]);
+        if let Err(error) = self.consensus.add_unconfirmed_transaction(transaction, on_verified).await {
             trace!("[UnconfirmedTransaction] {error}");
-            return true; // Maintain the connection.
         }
-        let message = Message::UnconfirmedTransaction(serialized);
-        // Propagate the "UnconfirmedTransaction" to the connected validators.
-        self.propagate_to_validators(message, &[peer_ip]);
-        true
+        true // Maintain the connection.
     }
 }
