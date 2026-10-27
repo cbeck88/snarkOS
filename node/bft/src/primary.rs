@@ -31,6 +31,7 @@ use crate::{
     Worker,
     events::{BatchPropose, BatchSignature, Event},
     helpers::{
+        InputLocks,
         PrimaryReceiver,
         PrimarySender,
         Proposal,
@@ -186,6 +187,11 @@ pub struct Primary<N: Network> {
     /// The recently-signed batch proposals.
     signed_proposals: Arc<RwLock<SignedProposals<N>>>,
 
+    /// The lock keys of the transactions this validator admitted or lock-signed, not yet settled in a
+    /// block. Consensus takes the keys at admission and clears them on block advance; the primary
+    /// confirms them when it signs a lock (see [`InputLocks`]).
+    input_locks: Arc<Mutex<InputLocks<N>>>,
+
     /// Cancels the resends launched by the latest recheck of the pending proposal.
     /// Replaced (and the old one cancelled) on every recheck, so at most one set of resends is in flight.
     resend_token: Arc<Mutex<CancellationToken>>,
@@ -255,6 +261,7 @@ impl<N: Network> Primary<N> {
             batch_propose_start: Default::default(),
             latest_proposal_timestamp: Default::default(),
             signed_proposals: Default::default(),
+            input_locks: Default::default(),
             resend_token: Default::default(),
             handles: Default::default(),
             proposal_task: Default::default(),
@@ -388,6 +395,11 @@ impl<N: Network> Primary<N> {
     /// Returns the ledger.
     pub const fn ledger(&self) -> &Arc<dyn LedgerService<N>> {
         &self.ledger
+    }
+
+    /// Returns the lock table, shared with consensus.
+    pub const fn input_locks(&self) -> &Arc<Mutex<InputLocks<N>>> {
+        &self.input_locks
     }
 
     /// Returns the number of workers.

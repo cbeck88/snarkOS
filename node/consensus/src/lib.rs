@@ -114,7 +114,9 @@ pub struct Consensus<N: Network> {
     seen_solutions: Arc<Mutex<LruCache<SolutionID<N>, ()>>>,
     /// The recently-seen unconfirmed transactions.
     seen_transactions: Arc<Mutex<LruCache<N::TransactionID, ()>>>,
-    /// The lock keys of the admitted transactions that are not yet settled in a block.
+    /// The lock keys of the admitted and lock-signed transactions that are not yet settled in a block.
+    /// This is the primary's table (see `Primary::input_locks`), so the keys a transaction takes at
+    /// admission are the entry its lock signature confirms.
     input_locks: Arc<Mutex<InputLocks<N>>>,
     #[cfg(feature = "metrics")]
     transmissions_tracker: Arc<Mutex<HashMap<TransmissionID<N>, i64>>>,
@@ -173,6 +175,8 @@ impl<N: Network> Consensus<N> {
             dev,
             proposal_spent_limit_multiplier,
         )?;
+        // Share the primary's lock table.
+        let input_locks = bft.primary().input_locks().clone();
         // Initialize the consensus channels.
         let (consensus_sender, consensus_receiver) = init_consensus_channels();
 
@@ -186,7 +190,7 @@ impl<N: Network> Consensus<N> {
             transactions_queue: Default::default(),
             seen_solutions: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(1 << 16).unwrap()))),
             seen_transactions: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(1 << 16).unwrap()))),
-            input_locks: Default::default(),
+            input_locks,
             #[cfg(feature = "metrics")]
             transmissions_tracker: Default::default(),
             handles: Default::default(),
@@ -468,11 +472,12 @@ impl<N: Network> Consensus<N> {
                 let evicted = tx_queue.insert(transaction_id, transaction, priority_fee, Box::new(on_verified))?;
                 // The keys were checked under the same guards, and a transaction holding locks has its keys pending.
                 input_locks.insert(transaction_id, lock_keys, height).expect("the lock keys were checked above");
-                // Drop the locks of the evicted transaction, if any (the queue dropped its callback), and
+                // Release the locks of the evicted transaction, if any (the queue dropped its callback), and
                 // forget it in the seen cache, so it can be resubmitted: it was never checked. A transaction
                 // that failed the check, or that the BFT already had, stays seen.
+                // Note: A lock this node signed survives the release (see `InputLocks::release`).
                 if let Some(evicted) = evicted {
-                    input_locks.remove(&evicted);
+                    input_locks.release(&evicted);
                     self.seen_transactions.lock().pop(&evicted);
                 }
             }
@@ -620,8 +625,10 @@ impl<N: Network> Consensus<N> {
                     fmt_id(transaction_id)
                 ),
                 Err(err) => {
-                    // A transaction that failed the check will not reach a block, so its locks are cleared.
-                    self.input_locks.lock().remove(&transaction_id);
+                    // A transaction that failed the check will not reach a block, so its locks are released.
+                    // Note: A lock this node signed survives the release (see `InputLocks::release`): a transaction
+                    // whose lock round did not complete stays locked until its lock expires.
+                    self.input_locks.lock().release(&transaction_id);
                     // If the BFT is synced, then log the warning.
                     if self.bft.is_synced() {
                         let err = err.context(format!(

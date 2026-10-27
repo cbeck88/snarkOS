@@ -48,6 +48,9 @@ pub use disconnect::{Disconnect, DisconnectReason};
 mod helpers;
 pub use helpers::*;
 
+mod lock_key;
+pub use lock_key::LockKey;
+
 mod primary_ping;
 pub use primary_ping::PrimaryPing;
 
