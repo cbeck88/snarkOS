@@ -19,19 +19,25 @@ use super::*;
 pub struct TransmissionResponse<N: Network> {
     pub transmission_id: TransmissionID<N>,
     pub transmission: Transmission<N>,
+    /// The lock certificate of the transaction, if the responder holds one (see `LockCertificate`).
+    pub lock_certificate: Option<LockCertificate<N>>,
 }
 
 impl<N: Network> TransmissionResponse<N> {
     /// Initializes a new transmission response event.
-    pub fn new(transmission_id: TransmissionID<N>, transmission: Transmission<N>) -> Self {
-        Self { transmission_id, transmission }
+    pub fn new(
+        transmission_id: TransmissionID<N>,
+        transmission: Transmission<N>,
+        lock_certificate: Option<LockCertificate<N>>,
+    ) -> Self {
+        Self { transmission_id, transmission, lock_certificate }
     }
 }
 
 impl<N: Network> From<(TransmissionID<N>, Transmission<N>)> for TransmissionResponse<N> {
-    /// Initializes a new transmission response event.
+    /// Initializes a new transmission response event, without a lock certificate.
     fn from((transmission_id, transmission): (TransmissionID<N>, Transmission<N>)) -> Self {
-        Self::new(transmission_id, transmission)
+        Self::new(transmission_id, transmission, None)
     }
 }
 
@@ -47,6 +53,13 @@ impl<N: Network> ToBytes for TransmissionResponse<N> {
     fn write_le<W: Write>(&self, mut writer: W) -> IoResult<()> {
         self.transmission_id.write_le(&mut writer)?;
         self.transmission.write_le(&mut writer)?;
+        match &self.lock_certificate {
+            Some(lock_certificate) => {
+                1u8.write_le(&mut writer)?;
+                lock_certificate.write_le(&mut writer)?;
+            }
+            None => 0u8.write_le(&mut writer)?,
+        }
         Ok(())
     }
 }
@@ -55,8 +68,13 @@ impl<N: Network> FromBytes for TransmissionResponse<N> {
     fn read_le<R: Read>(mut reader: R) -> IoResult<Self> {
         let transmission_id = TransmissionID::read_le(&mut reader)?;
         let transmission = Transmission::read_le(&mut reader)?;
+        let lock_certificate = match u8::read_le(&mut reader)? {
+            0 => None,
+            1 => Some(LockCertificate::read_le(&mut reader)?),
+            2.. => return Err(error("Invalid lock certificate flag in transmission response")),
+        };
 
-        Ok(Self { transmission_id, transmission })
+        Ok(Self { transmission_id, transmission, lock_certificate })
     }
 }
 
@@ -64,6 +82,7 @@ impl<N: Network> FromBytes for TransmissionResponse<N> {
 pub mod prop_tests {
     use crate::{
         TransmissionResponse,
+        lock_certificate::prop_tests::any_lock_certificate,
         prop_tests::{any_solution_id, any_transaction_id, any_transmission_checksum},
     };
     use snarkvm::{
@@ -100,7 +119,9 @@ pub mod prop_tests {
     }
 
     pub fn any_transmission_response() -> BoxedStrategy<TransmissionResponse<CurrentNetwork>> {
-        any_transmission().prop_map(|(id, t)| TransmissionResponse::new(id, t)).boxed()
+        (any_transmission(), proptest::option::of(any_lock_certificate()))
+            .prop_map(|((id, t), lock_certificate)| TransmissionResponse::new(id, t, lock_certificate))
+            .boxed()
     }
 
     #[proptest]

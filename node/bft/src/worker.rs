@@ -263,6 +263,14 @@ impl<N: Network> Worker<N> {
         self.lock_certificates.write().insert(transmission_id, certificate);
     }
 
+    /// Drops the lock certificates of the transmissions that are neither in the ready queue nor in the
+    /// given proposal. This runs at each proposal, so a certificate fetched for a peer's proposal this
+    /// node did not sign, or left behind by a transmission the proposal skipped, lives at most one round.
+    pub(crate) fn retain_lock_certificates(&self, proposed: &IndexMap<TransmissionID<N>, Transmission<N>>) {
+        let ready = self.ready.read();
+        self.lock_certificates.write().retain(|id, _| ready.contains(*id) || proposed.contains_key(id));
+    }
+
     /// Reinserts the specified transmission into the ready queue.
     pub(crate) fn reinsert(&self, transmission_id: TransmissionID<N>, transmission: Transmission<N>) -> bool {
         // Check if the transmission ID exists.
@@ -645,21 +653,36 @@ impl<N: Network> Worker<N> {
     }
 
     /// Handles the incoming transmission response.
-    /// This method ensures the transmission response is well-formed and matches the transmission ID.
+    /// This method ensures the transmission response is well-formed and matches the transmission ID,
+    /// and keeps the lock certificate it carries, if any, for the primary to check before signing a
+    /// proposal naming the transmission (see `Primary::check_lock_certificates_before_signing`).
     fn finish_transmission_request(&self, peer_ip: SocketAddr, response: TransmissionResponse<N>) {
-        let TransmissionResponse { transmission_id, mut transmission } = response;
+        let TransmissionResponse { transmission_id, mut transmission, lock_certificate } = response;
         // Check if the peer IP exists in the pending queue for the given transmission ID.
         let exists = self.pending.get_peers(transmission_id).unwrap_or_default().contains(&peer_ip);
         // If the peer IP exists, finish the pending request.
         if exists {
-            // Ensure the transmission is not a fee and matches the transmission ID.
-            match self.ledger.ensure_transmission_is_well_formed(transmission_id, &mut transmission) {
+            // Ensure the transmission is not a fee and matches the transmission ID, and that the lock
+            // certificate, if any, is for this transmission (its signatures are checked where it is used).
+            let result =
+                self.ledger.ensure_transmission_is_well_formed(transmission_id, &mut transmission).and_then(|()| {
+                    match &lock_certificate {
+                        Some(certificate) if *certificate.transmission_id() != transmission_id => {
+                            bail!("Received a lock certificate for another transmission")
+                        }
+                        _ => Ok(()),
+                    }
+                });
+            match result {
                 Ok(()) => {
                     trace!(
                         "Received valid transmission response from peer '{peer_ip}' for transmission '{}'",
                         self.format_transmission_id(transmission_id)
                     );
-                    // Remove the transmission ID from the pending queue.
+                    // Keep the lock certificate, then remove the transmission ID from the pending queue.
+                    if let Some(certificate) = lock_certificate {
+                        self.insert_lock_certificate(transmission_id, certificate);
+                    }
                     self.pending.remove(transmission_id, Some(transmission));
                 }
                 Err(err) => warn!("Failed to finish transmission response from peer '{peer_ip}': {err}"),
@@ -667,15 +690,17 @@ impl<N: Network> Worker<N> {
         }
     }
 
-    /// Sends the requested transmission to the specified peer.
+    /// Sends the requested transmission to the specified peer, with its lock certificate if this worker holds one.
     fn send_transmission_response(&self, peer_ip: SocketAddr, request: TransmissionRequest<N>) {
         let TransmissionRequest { transmission_id } = request;
         // Attempt to retrieve the transmission.
         if let Some(transmission) = self.get_transmission(transmission_id) {
+            let lock_certificate = self.lock_certificate(&transmission_id);
             // Send the transmission response to the peer.
             let self_ = self.clone();
             tokio::spawn(async move {
-                self_.gateway.send(peer_ip, Event::TransmissionResponse((transmission_id, transmission).into())).await;
+                let response = TransmissionResponse::new(transmission_id, transmission, lock_certificate);
+                self_.gateway.send(peer_ip, Event::TransmissionResponse(response)).await;
             });
         }
     }
@@ -961,6 +986,7 @@ mod tests {
         worker.finish_transmission_request(peer_ip, TransmissionResponse {
             transmission_id,
             transmission: Transmission::Solution(Data::Buffer(Bytes::from(vec![0; 512]))),
+            lock_certificate: None,
         });
         // Check the transmission was removed from the pending set.
         assert!(!worker.pending.contains(transmission_id));

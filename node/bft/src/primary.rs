@@ -804,6 +804,30 @@ impl<N: Network> proposal_task::BatchPropose for Primary<N> {
                             continue;
                         }
 
+                        // Where lock certificates are required, propose only a lock-certified transaction, whose
+                        // certificate still has a quorum of this round's committee (its lock round may have run
+                        // under an earlier one). One without is discarded: its keys are released by expiry.
+                        // Note: Solutions have no lock key, and need no certificate.
+                        if self.requires_lock_certificates() {
+                            match worker.lock_certificate(&id) {
+                                Some(certificate) if certificate.is_quorum_threshold_reached(&committee_lookback) => {}
+                                Some(_) => {
+                                    debug!(
+                                        "Proposing - Skipping and discarding transaction '{}' - Lock certificate has no quorum in the committee for round {round}",
+                                        fmt_id(transaction_id)
+                                    );
+                                    continue;
+                                }
+                                None => {
+                                    debug!(
+                                        "Proposing - Skipping and discarding transaction '{}' - No lock certificate",
+                                        fmt_id(transaction_id)
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+
                         // Compute the next proposal cost.
                         // Note: We purposefully discard this transaction if the proposal cost overflows.
                         let Some(next_proposal_cost) = proposal_cost.checked_add(cost) else {
@@ -844,6 +868,11 @@ impl<N: Network> proposal_task::BatchPropose for Primary<N> {
                 transmissions.insert(id, transmission);
                 num_worker_transmissions = num_worker_transmissions.saturating_add(1);
             }
+        }
+
+        // Drop the lock certificates of the transmissions that are neither queued nor proposed.
+        for worker in self.workers() {
+            worker.retain_lock_certificates(&transmissions);
         }
 
         // Determine the current timestamp.
@@ -1062,11 +1091,28 @@ impl<N: Network> Primary<N> {
             return Ok(());
         };
 
+        // Where lock certificates are required, refuse to sign unless every transaction the batch names
+        // that is not yet in storage carries a valid lock certificate from the committee of the batch round.
+        if self.requires_lock_certificates()
+            && let Err(err) = self.check_lock_certificates_before_signing(batch_round, &missing_transmissions).await
+        {
+            // The peer is not penalized: a certificate's quorum depends on the committee, and the peer may be
+            // behind or ahead of this node.
+            warn!(
+                "Refusing to sign the batch proposal for round {batch_round} from '{peer_ip}' ({batch_author}) - {}",
+                flatten_error(err)
+            );
+            return Ok(());
+        }
+
         // Check the transactions the batch names that are not yet in storage, whether just fetched from
         // the peer or already held by a worker (a transaction fetched on a worker ping is unverified),
         // and refuse to sign if any fails or the checks time out. A certificate commits every
         // validator to the transactions it names, so nothing is signed that this node has not checked.
         // Note: Solutions are checked for well-formedness only (above); checking them here is a separate change.
+        // Note: Once lock certificates are universal, this check is redundant for transactions: a valid lock
+        // certificate carries a quorum of signatures, each given only after the same full check, and this
+        // node's own lock signature makes it a cache hit here. It can then be dropped.
         if let Err(err) = self.check_transactions_before_signing(&missing_transmissions).await {
             // The peer is not penalized: an honest proposer may hold a different view of the ledger.
             warn!(
@@ -2225,6 +2271,57 @@ impl<N: Network> Primary<N> {
         )
         .await
         .map_err(|_| anyhow!("timed out after {MAX_PROPOSAL_CHECK_TIMEOUT:?} checking the transactions"))?
+    }
+
+    /// Ensures every transaction among the given transmissions carries a valid lock certificate from the
+    /// committee of the given round: one its worker holds for it, from this node's own lock round or fetched
+    /// with the transmission, whose keys are the transaction's, and whose signatures are a quorum of distinct
+    /// members of that committee. A transmission without one, or with an invalid one, is an error.
+    async fn check_lock_certificates_before_signing(
+        &self,
+        batch_round: u64,
+        transmissions: &HashMap<TransmissionID<N>, Transmission<N>>,
+    ) -> Result<()> {
+        // Retrieve the committee lookback for the batch round.
+        let committee = Arc::new(self.ledger.get_committee_lookback_for_round(batch_round)?);
+        // Initialize a list for the checks.
+        let mut checks = FuturesUnordered::new();
+        for (transmission_id, transmission) in transmissions {
+            // Skip anything other than a transaction: solutions have no lock key.
+            let (TransmissionID::Transaction(..), Transmission::Transaction(transaction)) =
+                (*transmission_id, transmission)
+            else {
+                continue;
+            };
+            // Retrieve the certificate from the worker.
+            let worker_id = assign_to_worker(*transmission_id, self.num_workers())?;
+            let Some(certificate) = self.workers()[worker_id as usize].lock_certificate(transmission_id) else {
+                bail!("transaction '{}' has no lock certificate", fmt_id(transmission_id));
+            };
+            let (transmission_id, transaction, committee) = (*transmission_id, transaction.clone(), committee.clone());
+            checks.push(async move {
+                let result = spawn_blocking!({
+                    ensure!(
+                        *certificate.transmission_id() == transmission_id,
+                        "the lock certificate is for another transmission"
+                    );
+                    // Deserialize the transaction (a no-op once `ensure_transmission_is_well_formed` has run).
+                    let transaction = deserialize_transaction_strict(transaction)?;
+                    ensure!(
+                        certificate.keys() == LockKey::from_transaction(&transaction)?,
+                        "the lock certificate keys are not the transaction's"
+                    );
+                    certificate.verify(&committee)
+                });
+                (transmission_id, result)
+            });
+        }
+        // Wait for the checks to complete, returning on the first failure.
+        while let Some((transmission_id, result)) = checks.next().await {
+            result
+                .with_context(|| format!("transaction '{}' has no valid lock certificate", fmt_id(transmission_id)))?;
+        }
+        Ok(())
     }
 
     /// Inserts the missing transmissions from the proposal into the workers.
