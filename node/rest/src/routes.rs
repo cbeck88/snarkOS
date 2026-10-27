@@ -1237,8 +1237,13 @@ impl<N: Network, C: ConsensusStorage<N>, R: Routing<N>> Rest<N, C, R> {
     ///                           |         |        |         |
     ///                           v         v        v         v
     ///                          200       422      203       503
+    ///
+    /// The transaction is propagated to peers only after the node has verified it: on a validator once
+    /// the BFT worker has checked it; on a client once this route has checked it (`check_transaction`),
+    /// and otherwise through the node's inbound handler.
     pub(crate) async fn transaction_broadcast(
         State(rest): State<Self>,
+        ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
         check_transaction: Query<CheckTransaction>,
         json_result: Result<Json<Transaction<N>>, JsonRejection>,
     ) -> Result<impl axum::response::IntoResponse, RestError> {
@@ -1255,17 +1260,11 @@ impl<N: Network, C: ConsensusStorage<N>, R: Routing<N>> Rest<N, C, R> {
         // The buffer is initially roughly sized to hold a `transfer_public`,
         // most transactions will be smaller and this reduces unnecessary allocations.
         // TODO: Should this be a blocking task?
-        let buffer = Vec::with_capacity(3000);
-        if tx.write_le(LimitedWriter::new(buffer, N::LATEST_MAX_TRANSACTION_SIZE())).is_err() {
+        let mut bytes = Vec::with_capacity(3000);
+        if tx.write_le(LimitedWriter::new(&mut bytes, N::LATEST_MAX_TRANSACTION_SIZE())).is_err() {
             return Err(RestError::bad_request(anyhow!("Transaction size exceeds the byte limit")));
         }
-
-        // Prepare the unconfirmed transaction message.
         let tx_id = tx.id();
-        let message = Message::UnconfirmedTransaction(UnconfirmedTransaction {
-            transaction_id: tx_id,
-            transaction: Data::Object(tx.clone()),
-        });
 
         // Check if the node is within sync leniency.
         let is_within_sync_leniency = rest.routing.is_within_sync_leniency();
@@ -1306,14 +1305,24 @@ impl<N: Network, C: ConsensusStorage<N>, R: Routing<N>> Rest<N, C, R> {
             tx
         };
 
-        // If the consensus module is enabled, add the unconfirmed transaction to the memory pool.
-        if let Some(consensus) = rest.consensus {
-            // Add the unconfirmed transaction to the memory pool.
-            consensus.add_unconfirmed_transaction(tx.clone()).await?;
-        }
+        // Prepare the unconfirmed transaction message, reusing the serialized bytes.
+        let serialized = UnconfirmedTransaction { transaction_id: tx_id, transaction: Data::Buffer(bytes.into()) };
 
-        // Broadcast the transaction.
-        rest.routing.propagate(message, &[]);
+        match &rest.consensus {
+            // If the consensus module is enabled, add the unconfirmed transaction to the memory pool,
+            // and broadcast it once the BFT worker has verified it.
+            Some(consensus) => {
+                let routing = rest.routing.clone();
+                let on_verified = move || routing.propagate(Message::UnconfirmedTransaction(serialized), &[]);
+                consensus.add_unconfirmed_transaction(tx, on_verified).await?;
+            }
+            // Otherwise, broadcast the transaction if it was checked above.
+            None if check_transaction => rest.routing.propagate(Message::UnconfirmedTransaction(serialized), &[]),
+            // Otherwise, hand it to the node's inbound handler, which verifies it before relaying.
+            None => {
+                rest.routing.unconfirmed_transaction(peer_addr, serialized, tx).await;
+            }
+        }
 
         // Determine if the node is synced and if the transaction was checked.
         match !is_within_sync_leniency && check_transaction {
