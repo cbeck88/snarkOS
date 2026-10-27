@@ -16,7 +16,7 @@
 use crate::common::test_peer::sample_genesis_block;
 
 use snarkos_account::Account;
-use snarkos_node::{Client, Prover, Validator, rest::RestVerificationLimits};
+use snarkos_node::{Client, DEFAULT_STATE_ROOT_RETRIES, Prover, Validator, rest::RestVerificationLimits};
 use snarkos_utilities::{NodeDataDir, SignalHandler};
 
 use snarkvm::prelude::{MainnetV0 as CurrentNetwork, store::helpers::memory::ConsensusMemory};
@@ -39,6 +39,7 @@ pub async fn client() -> Client<CurrentNetwork, ConsensusMemory<CurrentNetwork>>
         StorageMode::new_test(None),
         NodeDataDir::new_test(None),
         false, // Connect to untrusted peers.
+        DEFAULT_STATE_ROOT_RETRIES,
         None,
         SignalHandler::new(None),
     )

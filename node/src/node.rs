@@ -195,6 +195,7 @@ impl<N: Network> Node<N> {
         node_data_dir: NodeDataDir,
         trusted_peers_only: bool,
         auto_db_checkpoints: Option<PathBuf>,
+        state_root_retries: u32,
         dev: Option<u16>,
         signal_handler: Arc<SignalHandler>,
     ) -> Result<Self> {
@@ -213,6 +214,7 @@ impl<N: Network> Node<N> {
                 storage_mode,
                 node_data_dir,
                 trusted_peers_only,
+                state_root_retries,
                 dev,
                 signal_handler,
             )

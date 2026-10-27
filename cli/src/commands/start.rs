@@ -21,6 +21,7 @@ use crate::helpers::{
 use snarkos_account::Account;
 use snarkos_display::Display;
 use snarkos_node::{
+    DEFAULT_STATE_ROOT_RETRIES,
     Node,
     bft::MEMORY_POOL_PORT,
     network::{NodeType, bootstrap_peers},
@@ -255,6 +256,11 @@ pub struct Start {
         group = "rest_flags"
     )]
     pub num_verifying_solutions: usize,
+
+    /// How many times a client re-checks an unconfirmed transaction whose global state root is not yet known,
+    /// one block interval apart, before dropping it (0 drops it at once)
+    #[clap(long, default_value_t = DEFAULT_STATE_ROOT_RETRIES)]
+    pub state_root_retries: u32,
 
     /// Serve the routes of the removed `history` feature (`/program/{id}/mapping/{name}/{key}/history/{height}`,
     /// `/staking/rewards/{address}/{height}`, ...) from the Provable historical staking API instead of local
@@ -1004,7 +1010,7 @@ impl Start {
         let node = match node_type {
             NodeType::Validator => Node::new_validator(node_ip, self.bft, rest_ip, self.rest_rps, rest_verification_limits, history_api_url.clone(), self.history_json, account, &trusted_peers, &trusted_validators, genesis, cdn, storage_mode, node_data_dir, self.trusted_peers_only, self.auto_db_checkpoints.clone(), dev_txs, self.dev, dev_hotswap_config, self.proposal_spent_limit_multiplier, signal_handler.clone()).await,
             NodeType::Prover => Node::new_prover(node_ip, account, &trusted_peers, genesis, node_data_dir, self.trusted_peers_only, self.dev, signal_handler.clone()).await,
-            NodeType::Client => Node::new_client(node_ip, rest_ip, self.rest_rps, rest_verification_limits, history_api_url.clone(), self.history_json, account, &trusted_peers, genesis, cdn, storage_mode, node_data_dir, self.trusted_peers_only, self.auto_db_checkpoints.clone(), self.dev, signal_handler.clone()).await,
+            NodeType::Client => Node::new_client(node_ip, rest_ip, self.rest_rps, rest_verification_limits, history_api_url.clone(), self.history_json, account, &trusted_peers, genesis, cdn, storage_mode, node_data_dir, self.trusted_peers_only, self.auto_db_checkpoints.clone(), self.state_root_retries, self.dev, signal_handler.clone()).await,
             NodeType::BootstrapClient => Node::new_bootstrap_client(node_ip, account, *genesis.header(), self.dev).await,
         }?;
 
@@ -1745,6 +1751,17 @@ mod tests {
         } else {
             panic!("Unexpected result of clap parsing!");
         }
+    }
+
+    #[test]
+    fn state_root_retries_default_and_parse() {
+        let config = Start::try_parse_from(["snarkos"].iter()).unwrap();
+        assert_eq!(config.state_root_retries, DEFAULT_STATE_ROOT_RETRIES);
+        let config = Start::try_parse_from(["snarkos", "--state-root-retries", "0"].iter()).unwrap();
+        assert_eq!(config.state_root_retries, 0);
+        let config = Start::try_parse_from(["snarkos", "--state-root-retries", "7"].iter()).unwrap();
+        assert_eq!(config.state_root_retries, 7);
+        assert!(Start::try_parse_from(["snarkos", "--state-root-retries", "-1"].iter()).is_err());
     }
 
     #[test]

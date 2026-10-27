@@ -343,13 +343,13 @@ impl<N: Network, C: ConsensusStorage<N>> Inbound<N> for Client<N, C> {
             Transaction::<N>::Deploy(..) => {
                 let mut deploy_queue = self.deploy_queue.lock();
                 if !deploy_queue.contains(&transaction.id()) {
-                    deploy_queue.put(transaction.id(), (peer_ip, serialized, transaction));
+                    deploy_queue.put(transaction.id(), (peer_ip, serialized, transaction, 0));
                 }
             }
             Transaction::<N>::Execute(..) => {
                 let mut execute_queue = self.execute_queue.lock();
                 if !execute_queue.contains(&transaction.id()) {
-                    execute_queue.put(transaction.id(), (peer_ip, serialized, transaction));
+                    execute_queue.put(transaction.id(), (peer_ip, serialized, transaction, 0));
                 }
             }
         }

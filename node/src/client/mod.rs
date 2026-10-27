@@ -16,7 +16,7 @@
 mod router;
 
 use crate::{
-    bft::{helpers::fmt_id, ledger_service::CoreLedgerService, spawn_blocking},
+    bft::{MAX_BATCH_DELAY, helpers::fmt_id, ledger_service::CoreLedgerService, spawn_blocking},
     cdn::CdnBlockSync,
     traits::NodeInterface,
 };
@@ -87,10 +87,18 @@ const CAPACITY_FOR_EXECUTIONS: usize = 1 << 10;
 /// The capacity for storing unconfirmed solutions.
 /// Note: This is an inbound queue capacity, not a Narwhal-enforced capacity.
 const CAPACITY_FOR_SOLUTIONS: usize = 1 << 10;
+/// The default number of times a client re-checks an unconfirmed transaction whose global state root
+/// is not yet known, before dropping it.
+pub const DEFAULT_STATE_ROOT_RETRIES: u32 = 3;
+/// The delay before a client re-checks an unconfirmed transaction whose global state root is not yet known.
+/// A block spans at least one batch round, and a client that is one block behind has typically already
+/// requested the block from its peers, so one `MAX_BATCH_DELAY` is enough to receive it.
+const STATE_ROOT_RETRY_DELAY: Duration = MAX_BATCH_DELAY;
 
-/// Transaction details needed for propagation.
+/// Transaction details needed for propagation, and the number of times the transaction was re-checked
+/// because its global state root was not yet known.
 /// We preserve the serialized transaction for faster propagation.
-type TransactionContents<N> = (SocketAddr, UnconfirmedTransaction<N>, Transaction<N>);
+type TransactionContents<N> = (SocketAddr, UnconfirmedTransaction<N>, Transaction<N>, u32);
 /// Solution details needed for propagation.
 /// We preserve the serialized solution for faster propagation.
 type SolutionContents<N> = (SocketAddr, UnconfirmedSolution<N>, Solution<N>);
@@ -122,6 +130,8 @@ pub struct Client<N: Network, C: ConsensusStorage<N>> {
     num_verifying_deploys: Arc<AtomicUsize>,
     /// The amount of executions currently being verified.
     num_verifying_executions: Arc<AtomicUsize>,
+    /// The number of times an unconfirmed transaction whose global state root is not yet known is re-checked.
+    state_root_retries: u32,
     /// The spawned handles.
     pub(crate) handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
     /// Keeps track of sending pings.
@@ -146,6 +156,7 @@ impl<N: Network, C: ConsensusStorage<N>> Client<N, C> {
         storage_mode: StorageMode,
         node_data_dir: NodeDataDir,
         trusted_peers_only: bool,
+        state_root_retries: u32,
         dev: Option<u16>,
         signal_handler: Arc<SignalHandler>,
     ) -> Result<Self> {
@@ -201,6 +212,7 @@ impl<N: Network, C: ConsensusStorage<N>> Client<N, C> {
             num_verifying_solutions: Default::default(),
             num_verifying_deploys: Default::default(),
             num_verifying_executions: Default::default(),
+            state_root_retries,
             handles: Default::default(),
             signal_handler: signal_handler.clone(),
         };
@@ -433,7 +445,8 @@ impl<N: Network, C: ConsensusStorage<N>> Client<N, C> {
                 }
 
                 // Try to verify deployments.
-                while let Some((_, (peer_ip, serialized, transaction))) = node.deploy_queue.lock().pop_lru() {
+                while let Some((_, (peer_ip, serialized, transaction, attempts))) = node.deploy_queue.lock().pop_lru()
+                {
                     // Increment the verification counter.
                     let previous_counter = node.num_verifying_deploys.fetch_add(1, Relaxed);
                     let _node = node.clone();
@@ -445,14 +458,19 @@ impl<N: Network, C: ConsensusStorage<N>> Client<N, C> {
                             _node.num_verifying_deploys.fetch_sub(1, Relaxed);
                             return;
                         };
-                        // Check if the state root is in the ledger.
+                        // Check if the state root is in the ledger; if not, re-check later, or drop.
                         if !_node.ledger().contains_state_root(&state_root).unwrap_or(false) {
-                            debug!("Failed to find global state root for deployment from peer_ip {peer_ip}, propagating anyway");
-                            // Propagate the `UnconfirmedTransaction`.
-                            _node.propagate(Message::UnconfirmedTransaction(serialized), &[peer_ip]);
                             _node.num_verifying_deploys.fetch_sub(1, Relaxed);
+                            let retried = _node.retry_unknown_state_root(
+                                &_node.deploy_queue,
+                                (peer_ip, serialized, transaction, attempts),
+                            );
+                            if !retried {
+                                debug!(
+                                    "Failed to find global state root for deployment from peer_ip {peer_ip} after {attempts} re-checks, dropping"
+                                );
+                            }
                             return;
-                            // Also skip the `check_transaction_basic` call if it is already propagated.
                         }
                         // Check the deployment.
                         match _node.ledger.check_transaction_basic(&transaction, None, &mut rand::rng()) {
@@ -501,7 +519,9 @@ impl<N: Network, C: ConsensusStorage<N>> Client<N, C> {
                 }
 
                 // Try to verify executions.
-                while let Some((_, (peer_ip, serialized, transaction))) = node.execute_queue.lock().pop_lru() {
+                while let Some((_, (peer_ip, serialized, transaction, attempts))) =
+                    node.execute_queue.lock().pop_lru()
+                {
                     // Increment the verification counter.
                     let previous_counter = node.num_verifying_executions.fetch_add(1, Relaxed);
                     let _node = node.clone();
@@ -515,14 +535,20 @@ impl<N: Network, C: ConsensusStorage<N>> Client<N, C> {
                         .into_iter()
                         .flatten();
 
+                        // Check if the state roots are in the ledger; if not, re-check later, or drop.
                         for state_root in state_roots {
                             if !_node.ledger().contains_state_root(&state_root).unwrap_or(false) {
-                                debug!("Failed to find global state root for execution from peer_ip {peer_ip}, propagating anyway");
-                                // Propagate the `UnconfirmedTransaction`.
-                                _node.propagate(Message::UnconfirmedTransaction(serialized), &[peer_ip]);
                                 _node.num_verifying_executions.fetch_sub(1, Relaxed);
+                                let retried = _node.retry_unknown_state_root(
+                                    &_node.execute_queue,
+                                    (peer_ip, serialized, transaction, attempts),
+                                );
+                                if !retried {
+                                    debug!(
+                                        "Failed to find global state root for execution from peer_ip {peer_ip} after {attempts} re-checks, dropping"
+                                    );
+                                }
                                 return;
-                                // Also skip the `check_transaction_basic` call if it is already propagated.
                             }
                         }
                         // Check the execution.
@@ -545,6 +571,41 @@ impl<N: Network, C: ConsensusStorage<N>> Client<N, C> {
                 }
             }
         });
+    }
+
+    /// Puts a transaction whose global state root is not yet known back into its queue after
+    /// `STATE_ROOT_RETRY_DELAY`, with its attempt count incremented, so the verification loop checks it
+    /// again. Returns `false`, and leaves the transaction dropped, once it has been re-checked
+    /// `state_root_retries` times.
+    ///
+    /// The caller has released its verification slot; the wait holds none.
+    fn retry_unknown_state_root(
+        &self,
+        queue: &Arc<Mutex<LruCache<N::TransactionID, TransactionContents<N>>>>,
+        (peer_ip, serialized, transaction, attempts): TransactionContents<N>,
+    ) -> bool {
+        if attempts >= self.state_root_retries {
+            return false;
+        }
+        let transaction_id = transaction.id();
+        debug!(
+            "Global state root for transaction '{}' from peer_ip {peer_ip} is not yet known, re-checking in {:?} ({}/{})",
+            fmt_id(transaction_id),
+            STATE_ROOT_RETRY_DELAY,
+            attempts + 1,
+            self.state_root_retries
+        );
+        let queue = queue.clone();
+        tokio::spawn(async move {
+            sleep(STATE_ROOT_RETRY_DELAY).await;
+            let mut queue = queue.lock();
+            // The transaction may have arrived again from another peer meanwhile; that entry is kept,
+            // as it has fewer attempts behind it.
+            if !queue.contains(&transaction_id) {
+                queue.put(transaction_id, (peer_ip, serialized, transaction, attempts + 1));
+            }
+        });
+        true
     }
 
     /// Spawns a task with the given future; it should only be used for long-running tasks.
