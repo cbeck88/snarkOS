@@ -33,6 +33,7 @@ use crate::{
     events::{BatchPropose, BatchSignature, Event, LockCertificate, LockKey, LockRequest, LockResponse},
     helpers::{
         InputLocks,
+        LockRound,
         PrimaryReceiver,
         PrimarySender,
         Proposal,
@@ -46,6 +47,7 @@ use crate::{
         init_worker_channels,
         now,
     },
+    lock_certificate_height,
     spawn_blocking,
     sync::SyncCallback,
 };
@@ -98,7 +100,10 @@ use std::{
 };
 #[cfg(not(feature = "locktick"))]
 use tokio::sync::RwLock as TRwLock;
-use tokio::{sync::Notify, task::JoinHandle};
+use tokio::{
+    sync::{Notify, oneshot},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 /// The state of the primary's batch proposal.
@@ -193,6 +198,9 @@ pub struct Primary<N: Network> {
     /// confirms them when it signs a lock (see [`InputLocks`]).
     input_locks: Arc<Mutex<InputLocks<N>>>,
 
+    /// The lock rounds this primary is running, keyed by transmission ID (see [`Self::lock_transaction`]).
+    lock_rounds: Arc<Mutex<HashMap<TransmissionID<N>, LockRound<N>>>>,
+
     /// Cancels the resends launched by the latest recheck of the pending proposal.
     /// Replaced (and the old one cancelled) on every recheck, so at most one set of resends is in flight.
     resend_token: Arc<Mutex<CancellationToken>>,
@@ -263,6 +271,7 @@ impl<N: Network> Primary<N> {
             latest_proposal_timestamp: Default::default(),
             signed_proposals: Default::default(),
             input_locks: Default::default(),
+            lock_rounds: Default::default(),
             resend_token: Default::default(),
             handles: Default::default(),
             proposal_task: Default::default(),
@@ -401,6 +410,11 @@ impl<N: Network> Primary<N> {
     /// Returns the lock table, shared with consensus.
     pub const fn input_locks(&self) -> &Arc<Mutex<InputLocks<N>>> {
         &self.input_locks
+    }
+
+    /// Returns `true` if lock certificates are required at the current block height (see `lock_certificate_height`).
+    fn requires_lock_certificates(&self) -> bool {
+        self.ledger.latest_block_height() >= lock_certificate_height::<N>(self.gateway.dev())
     }
 
     /// Returns the number of workers.
@@ -1417,6 +1431,49 @@ impl<N: Network> Primary<N> {
         Ok(())
     }
 
+    /// Processes a lock response from a peer, adding its signature to the lock round for the transmission,
+    /// and certifying the lock once a quorum of the committee has signed.
+    async fn process_lock_response_from_peer(&self, peer_ip: SocketAddr, lock_response: LockResponse<N>) -> Result<()> {
+        let LockResponse { transmission_id, signature } = lock_response;
+
+        // Ensure the lock response is signed by the validator.
+        let signer = signature.to_address();
+        match self.gateway.resolve_to_aleo_addr(peer_ip) {
+            Some(address) if address == signer => {}
+            Some(_) => {
+                // Proceed to disconnect the validator.
+                self.gateway.disconnect(peer_ip);
+                bail!("Malicious peer - lock response is signed by a different validator ({signer})");
+            }
+            None => bail!("Lock response from a disconnected validator"),
+        }
+        // Ensure the lock response is not from the current primary.
+        if self.gateway.account().address() == signer {
+            bail!("Invalid peer - received a lock response from myself ({signer})");
+        }
+
+        // Add the signature to the lock round, if one is running: a response after the round has ended,
+        // in either outcome, is dropped.
+        let self_ = self.clone();
+        spawn_blocking!({
+            let mut lock_rounds = self_.lock_rounds.lock();
+            let Some(lock_round) = lock_rounds.get_mut(&transmission_id) else {
+                debug!(
+                    "Dropping a lock signature for '{}' from '{peer_ip}' - no lock round is running",
+                    fmt_id(transmission_id)
+                );
+                return Ok(());
+            };
+            if lock_round.add_signature(signer, signature)? && !lock_round.is_certified() {
+                debug!("Received a lock signature for '{}' from '{peer_ip}'", fmt_id(transmission_id));
+                if lock_round.is_quorum_threshold_reached() {
+                    lock_round.certify()?;
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Processes a batch certificate from a peer.
     ///
     /// This method performs the following steps:
@@ -1526,7 +1583,7 @@ impl<N: Network> Primary<N> {
             mut rx_batch_signature,
             mut rx_batch_certified,
             mut rx_lock_request,
-            rx_lock_response: _,
+            mut rx_lock_response,
             mut rx_primary_ping,
             mut rx_unconfirmed_solution,
             mut rx_unconfirmed_transaction,
@@ -1712,6 +1769,23 @@ impl<N: Network> Primary<N> {
             }
         });
 
+        // Start the lock response handler.
+        let self_ = self.clone();
+        self.spawn(async move {
+            while let Some((peer_ip, lock_response)) = rx_lock_response.recv().await {
+                // Process the lock response.
+                // Note: As for batch signatures, this is not spawned: a response is cheap to process, and
+                // processing them in order keeps each lock round's signature set consistent.
+                let id = fmt_id(lock_response.transmission_id);
+                if let Err(err) = self_.process_lock_response_from_peer(peer_ip, lock_response).await {
+                    debug!(
+                        "{}",
+                        flatten_error(err.context(format!("Cannot add a lock signature for '{id}' from '{peer_ip}'")))
+                    );
+                }
+            }
+        });
+
         // This task tries to move to the next round when triggered (e.g. after a certificate is stored)
         // or after a timeout, so we are not stuck on a previous round despite having quorum.
         let self_ = self.clone();
@@ -1807,7 +1881,7 @@ impl<N: Network> Primary<N> {
                     // Retrieve the worker.
                     let worker = &self__.workers().get(worker_id as usize).expect("Invalid worker ID");
                     // Process the unconfirmed transaction.
-                    let result = worker.process_unconfirmed_transaction(transaction_id, transaction).await;
+                    let result = self__.process_unconfirmed_transaction(worker, transaction_id, transaction).await;
                     // Send the result to the callback.
                     callback.send(result).ok();
                 });
@@ -2004,6 +2078,111 @@ impl<N: Network> Primary<N> {
         self.round_increment_notify.notify_one();
 
         Ok(())
+    }
+
+    /// Handles an incoming unconfirmed transaction: the worker checks it in full, the committee locks it
+    /// (see [`Self::lock_transaction`]), and it enters the worker's ready queue with its lock certificate.
+    ///
+    /// The lock round runs at every height. Below the lock certificate cutover (see `lock_certificate_height`),
+    /// a transaction whose lock round fails is queued without a certificate, as before; above it, it is not
+    /// queued, and its keys stay pending until the lock expires.
+    ///
+    /// # Returns
+    /// - `Ok(true)` if the transaction was added to the ready queue.
+    /// - `Ok(false)` if the transaction was valid but already exists in the BFT.
+    /// - `Err(anyhow::Error)` if the transaction was invalid, or could not be locked where a certificate is required.
+    async fn process_unconfirmed_transaction(
+        &self,
+        worker: &Worker<N>,
+        transaction_id: N::TransactionID,
+        transaction: Data<Transaction<N>>,
+    ) -> Result<bool> {
+        // Check the transaction.
+        let Some((transmission_id, transmission, transaction)) =
+            worker.check_unconfirmed_transaction(transaction_id, transaction).await?
+        else {
+            return Ok(false);
+        };
+        // Lock the transaction.
+        let lock_certificate = match self.lock_transaction(transmission_id, &transaction, &transmission).await {
+            Ok(certificate) => Some(certificate),
+            Err(err) if !self.requires_lock_certificates() => {
+                debug!(
+                    "Queueing transaction '{}' without a lock certificate (not required yet) - {}",
+                    fmt_id(transaction_id),
+                    flatten_error(err)
+                );
+                None
+            }
+            Err(err) => {
+                return Err(err.context(format!("Transaction '{}' could not be locked", fmt_id(transaction_id))));
+            }
+        };
+        // Add the transaction to the ready queue.
+        worker.insert_locked(transmission_id, transmission, lock_certificate);
+        Ok(true)
+    }
+
+    /// Runs a lock round for a transaction this node has checked in full: signs its lock, asks the committee
+    /// to sign it (`LockRequest`), and assembles the certificate from a quorum of responses (`LockResponse`),
+    /// this node's own signature included, within `MAX_LOCK_ROUND_TIMEOUT`.
+    ///
+    /// The transaction's keys are taken as signed before the request goes out, confirming the entry admission
+    /// took, and stay taken whatever the outcome: a lock that never reaches a quorum is released by expiry,
+    /// as on every responder that signed it (see [`InputLocks::release`]).
+    async fn lock_transaction(
+        &self,
+        transmission_id: TransmissionID<N>,
+        transaction: &Transaction<N>,
+        transmission: &Transmission<N>,
+    ) -> Result<LockCertificate<N>> {
+        let (TransmissionID::Transaction(transaction_id, _), Transmission::Transaction(transaction_data)) =
+            (transmission_id, transmission)
+        else {
+            bail!("Only a transaction can be locked");
+        };
+        // Determine the lock keys, and the committee whose quorum certifies the lock.
+        let keys = LockKey::from_transaction(transaction)?;
+        let committee = self.ledger.get_committee_lookback_for_round(self.current_round())?;
+        // Sign the lock ID.
+        let lock_id = LockCertificate::<N>::lock_id(&transmission_id, &keys)?;
+        let account = self.gateway.account().clone();
+        let signature = spawn_blocking!(account.sign(&[lock_id], &mut rand::rng()))?;
+        // Take the keys as signed.
+        self.input_locks.lock().sign(transaction_id, keys.clone(), self.ledger.latest_block_height())?;
+        // Register the lock round, with this node's signature.
+        let (certified, receiver) = oneshot::channel();
+        {
+            let mut lock_rounds = self.lock_rounds.lock();
+            if lock_rounds.contains_key(&transmission_id) {
+                bail!("A lock round for '{}' is already running", fmt_id(transmission_id));
+            }
+            let mut lock_round = LockRound::new(transmission_id, keys.clone(), committee, certified)?;
+            lock_round.add_signature(self.gateway.account().address(), signature)?;
+            // A committee of one is its own quorum.
+            if lock_round.is_quorum_threshold_reached() {
+                lock_round.certify()?;
+            }
+            lock_rounds.insert(transmission_id, lock_round);
+        }
+        // Ask the committee to sign the lock.
+        let request = LockRequest::new(transmission_id, keys, transaction_data.clone(), signature);
+        self.gateway.broadcast(Event::LockRequest(request));
+        // Wait for the certificate, then forget the round: a late response is dropped.
+        let result = tokio::time::timeout(MAX_LOCK_ROUND_TIMEOUT, receiver).await;
+        let lock_round = self.lock_rounds.lock().remove(&transmission_id);
+        match result {
+            Ok(Ok(certificate)) => Ok(certificate),
+            Ok(Err(_)) => bail!("The lock round for '{}' was abandoned", fmt_id(transmission_id)),
+            Err(_) => {
+                let (num_signatures, num_members) =
+                    lock_round.map_or((0, 0), |round| (round.num_signatures(), round.num_members()));
+                bail!(
+                    "Timed out after {MAX_LOCK_ROUND_TIMEOUT:?} waiting for a quorum of lock signatures for '{}' ({num_signatures} of {num_members})",
+                    fmt_id(transmission_id)
+                )
+            }
+        }
     }
 
     /// Checks every transaction among the given transmissions with the ledger, at most

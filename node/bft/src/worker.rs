@@ -21,7 +21,7 @@ use crate::{
     ProposedBatch,
     ProposedBatchState,
     Transport,
-    events::{Event, TransmissionRequest, TransmissionResponse},
+    events::{Event, LockCertificate, TransmissionRequest, TransmissionResponse},
     helpers::{Pending, Ready, Storage, WorkerReceiver, fmt_id, max_redundant_requests},
     spawn_blocking,
 };
@@ -43,7 +43,7 @@ use locktick::parking_lot::{Mutex, RwLock};
 use parking_lot::{Mutex, RwLock};
 use rand::seq::IteratorRandom;
 
-use std::{future::Future, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, future::Future, net::SocketAddr, sync::Arc};
 use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
 
 /// A worker's main role is maintaining a queue of verified ("ready") transmissions,
@@ -67,6 +67,10 @@ pub struct Worker<N: Network> {
     ready: Arc<RwLock<Ready<N>>>,
     /// The pending transmissions queue.
     pending: Arc<Pending<TransmissionID<N>, Transmission<N>>>,
+    /// The lock certificates of the transactions in the ready queue or the proposed batch, and of those
+    /// fetched from peers, keyed by transmission ID. A transaction is proposed with its certificate, and
+    /// the certificate is served with the transaction (see `TransmissionResponse`).
+    lock_certificates: Arc<RwLock<HashMap<TransmissionID<N>, LockCertificate<N>>>>,
     /// The spawned handles.
     handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
@@ -92,6 +96,7 @@ impl<N: Network> Worker<N> {
             proposed_batch,
             ready: Default::default(),
             pending: Default::default(),
+            lock_certificates: Default::default(),
             handles: Default::default(),
         })
     }
@@ -246,6 +251,16 @@ impl<N: Network> Worker<N> {
     /// Removes and returns the transmission at the front of the ready queue.
     pub(crate) fn remove_front(&self) -> Option<(TransmissionID<N>, Transmission<N>)> {
         self.ready.write().remove_front()
+    }
+
+    /// Returns the lock certificate of the given transmission, if this worker holds one.
+    pub(crate) fn lock_certificate(&self, transmission_id: &TransmissionID<N>) -> Option<LockCertificate<N>> {
+        self.lock_certificates.read().get(transmission_id).cloned()
+    }
+
+    /// Stores the lock certificate of the given transmission.
+    pub(crate) fn insert_lock_certificate(&self, transmission_id: TransmissionID<N>, certificate: LockCertificate<N>) {
+        self.lock_certificates.write().insert(transmission_id, certificate);
     }
 
     /// Reinserts the specified transmission into the ready queue.
@@ -443,17 +458,40 @@ impl<N: Network> Worker<N> {
         Ok(true)
     }
 
-    /// Handles the incoming unconfirmed transaction.
+    /// Handles the incoming unconfirmed transaction, without a lock round (see
+    /// `Primary::process_unconfirmed_transaction` for the path with one).
     ///
     /// # Returns
     /// - `Ok(true)` if the transaction was added to the ready queue.
     /// - `Ok(false)` if the transaction was valid but already exists in the ready queue.
     /// - `Err(anyhow::Error)` if the transaction was invalid.
+    #[cfg(test)]
     pub(crate) async fn process_unconfirmed_transaction(
         &self,
         transaction_id: N::TransactionID,
         transaction: Data<Transaction<N>>,
     ) -> Result<bool> {
+        match self.check_unconfirmed_transaction(transaction_id, transaction).await? {
+            Some((transmission_id, transmission, _)) => {
+                self.insert_locked(transmission_id, transmission, None);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Checks the incoming unconfirmed transaction: it is deserialized within the size limit and
+    /// checked in full by the ledger.
+    ///
+    /// # Returns
+    /// - `Ok(Some(..))` with the transmission ID, the transmission and the deserialized transaction, if it is valid.
+    /// - `Ok(None)` if the transaction already exists in the ready queue, proposed batch, storage, or ledger.
+    /// - `Err(anyhow::Error)` if the transaction was invalid.
+    pub(crate) async fn check_unconfirmed_transaction(
+        &self,
+        transaction_id: N::TransactionID,
+        transaction: Data<Transaction<N>>,
+    ) -> Result<Option<(TransmissionID<N>, Transmission<N>, Transaction<N>)>> {
         // Construct the transmission.
         let transmission = Transmission::Transaction(transaction.clone());
         // Compute the checksum.
@@ -464,22 +502,36 @@ impl<N: Network> Worker<N> {
         self.pending.remove(transmission_id, Some(transmission.clone()));
         // Check if the transaction ID exists.
         if self.contains_transmission(transmission_id) {
-            return Ok(false);
+            return Ok(None);
         }
         // Deserialize the transaction. If the transaction exceeds the maximum size, then return an error.
         let transaction = spawn_blocking!(deserialize_transaction_strict(transaction))?;
 
         // Check that the transaction is well-formed and unique.
-        self.ledger.check_transaction_basic(transaction_id, transaction).await?;
-        // Adds the transaction to the ready queue.
-        if self.ready.write().insert(transmission_id, transmission) {
+        self.ledger.check_transaction_basic(transaction_id, transaction.clone()).await?;
+        Ok(Some((transmission_id, transmission, transaction)))
+    }
+
+    /// Adds a checked transaction to the ready queue, with its lock certificate if it has one,
+    /// returning `true` if it was not there yet.
+    pub(crate) fn insert_locked(
+        &self,
+        transmission_id: TransmissionID<N>,
+        transmission: Transmission<N>,
+        lock_certificate: Option<LockCertificate<N>>,
+    ) -> bool {
+        let inserted = self.ready.write().insert(transmission_id, transmission);
+        if inserted {
+            if let Some(certificate) = lock_certificate {
+                self.insert_lock_certificate(transmission_id, certificate);
+            }
             trace!(
                 "Worker {} - Added unconfirmed transaction '{}'",
                 self.id,
                 self.format_transmission_id(transmission_id),
             );
         }
-        Ok(true)
+        inserted
     }
 }
 
