@@ -69,6 +69,18 @@ pub const CREATE_BATCH_INTERVAL: Duration = Duration::from_millis(250);
 /// TODO(kaimast): directy multiply by constant once the `const_trait_impl` feature is stable.
 pub const MAX_FETCH_TIMEOUT: Duration = Duration::from_millis(3 * (MAX_BATCH_DELAY.as_millis() as u64));
 
+/// The maximum time a primary waits for the transactions of a peer's batch proposal to be checked before signing it.
+/// A batch of transactions this node has not seen takes well under a second to check on an idle node, so this budget
+/// covers a loaded one; it equals `MAX_LEADER_CERTIFICATE_DELAY`, after which a signature is of no use to a leader,
+/// and it is shorter than `MAX_FETCH_TIMEOUT`, so fetching the transmissions remains the larger part of the wait.
+pub const MAX_PROPOSAL_CHECK_TIMEOUT: Duration = Duration::from_millis(2 * (MAX_BATCH_DELAY.as_millis() as u64));
+
+/// The maximum number of transactions of a peer's batch proposal that a primary checks at once.
+/// snarkVM's `MAX_PARALLEL_DEPLOY_VERIFICATIONS` and `MAX_PARALLEL_EXECUTE_VERIFICATIONS` are not reachable
+/// from here, and neither fits a mixed batch; 8 bounds the blocking threads a proposal of up to 50 transmissions
+/// holds in proof verification at once, and a batch of cache hits still completes in a few rounds.
+pub const MAX_PARALLEL_PROPOSAL_CHECKS: usize = 8;
+
 /// The maximum time allowed for the leader to send their certificate.
 /// After this time, the node will consider the leader as failed and try to advance the round without it.
 pub const MAX_LEADER_CERTIFICATE_DELAY: Duration = Duration::from_millis(2 * (MAX_BATCH_DELAY.as_millis() as u64));
