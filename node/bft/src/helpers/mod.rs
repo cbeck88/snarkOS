@@ -22,6 +22,12 @@ pub use channels::*;
 pub mod dag;
 pub use dag::*;
 
+pub mod input_locks;
+pub use input_locks::*;
+
+pub mod lock_round;
+pub use lock_round::*;
+
 pub mod partition;
 pub use partition::*;
 

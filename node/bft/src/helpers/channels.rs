@@ -18,6 +18,8 @@ use crate::events::{
     BatchSignature,
     CertificateRequest,
     CertificateResponse,
+    LockRequest,
+    LockResponse,
     TransmissionRequest,
     TransmissionResponse,
 };
@@ -65,6 +67,8 @@ pub struct PrimarySender<N: Network> {
     pub tx_batch_propose: mpsc::Sender<(SocketAddr, BatchPropose<N>)>,
     pub tx_batch_signature: mpsc::Sender<(SocketAddr, BatchSignature<N>)>,
     pub tx_batch_certified: mpsc::Sender<(SocketAddr, Data<BatchCertificate<N>>)>,
+    pub tx_lock_request: mpsc::Sender<(SocketAddr, LockRequest<N>)>,
+    pub tx_lock_response: mpsc::Sender<(SocketAddr, LockResponse<N>)>,
     pub tx_primary_ping: mpsc::Sender<(SocketAddr, Data<BatchCertificate<N>>)>,
     pub tx_unconfirmed_solution: mpsc::Sender<(SolutionID<N>, Data<Solution<N>>, oneshot::Sender<Result<bool>>)>,
     pub tx_unconfirmed_transaction:
@@ -116,6 +120,8 @@ pub struct PrimaryReceiver<N: Network> {
     pub rx_batch_propose: mpsc::Receiver<(SocketAddr, BatchPropose<N>)>,
     pub rx_batch_signature: mpsc::Receiver<(SocketAddr, BatchSignature<N>)>,
     pub rx_batch_certified: mpsc::Receiver<(SocketAddr, Data<BatchCertificate<N>>)>,
+    pub rx_lock_request: mpsc::Receiver<(SocketAddr, LockRequest<N>)>,
+    pub rx_lock_response: mpsc::Receiver<(SocketAddr, LockResponse<N>)>,
     pub rx_primary_ping: mpsc::Receiver<(SocketAddr, Data<BatchCertificate<N>>)>,
     pub rx_unconfirmed_solution: mpsc::Receiver<(SolutionID<N>, Data<Solution<N>>, oneshot::Sender<Result<bool>>)>,
     pub rx_unconfirmed_transaction:
@@ -127,6 +133,8 @@ pub fn init_primary_channels<N: Network>() -> (PrimarySender<N>, PrimaryReceiver
     let (tx_batch_propose, rx_batch_propose) = mpsc::channel(MAX_CHANNEL_SIZE);
     let (tx_batch_signature, rx_batch_signature) = mpsc::channel(MAX_CHANNEL_SIZE);
     let (tx_batch_certified, rx_batch_certified) = mpsc::channel(MAX_CHANNEL_SIZE);
+    let (tx_lock_request, rx_lock_request) = mpsc::channel(MAX_CHANNEL_SIZE);
+    let (tx_lock_response, rx_lock_response) = mpsc::channel(MAX_CHANNEL_SIZE);
     let (tx_primary_ping, rx_primary_ping) = mpsc::channel(MAX_CHANNEL_SIZE);
     let (tx_unconfirmed_solution, rx_unconfirmed_solution) = mpsc::channel(MAX_CHANNEL_SIZE);
     let (tx_unconfirmed_transaction, rx_unconfirmed_transaction) = mpsc::channel(MAX_CHANNEL_SIZE);
@@ -135,6 +143,8 @@ pub fn init_primary_channels<N: Network>() -> (PrimarySender<N>, PrimaryReceiver
         tx_batch_propose,
         tx_batch_signature,
         tx_batch_certified,
+        tx_lock_request,
+        tx_lock_response,
         tx_primary_ping,
         tx_unconfirmed_solution,
         tx_unconfirmed_transaction,
@@ -143,6 +153,8 @@ pub fn init_primary_channels<N: Network>() -> (PrimarySender<N>, PrimaryReceiver
         rx_batch_propose,
         rx_batch_signature,
         rx_batch_certified,
+        rx_lock_request,
+        rx_lock_response,
         rx_primary_ping,
         rx_unconfirmed_solution,
         rx_unconfirmed_transaction,

@@ -92,7 +92,7 @@ fn sample_transmission_response(size: usize, rng: &mut TestRng) -> Event<Current
         rng.random::<<CurrentNetwork as Network>::TransmissionChecksum>(),
     );
     let transmission = Transmission::Transaction(Data::Buffer(Bytes::from(vec![0xAB; size])));
-    Event::TransmissionResponse(TransmissionResponse::new(transmission_id, transmission))
+    Event::TransmissionResponse(TransmissionResponse::new(transmission_id, transmission, None))
 }
 
 /// Encodes the event exactly as a connection's writer task would.

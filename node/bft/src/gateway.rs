@@ -37,6 +37,8 @@ use snarkos_node_bft_events::{
     HANDSHAKE_DOMAIN,
     HandshakeHint,
     InitiatorInfo,
+    LockRequest,
+    LockResponse,
     PeerInfo,
     ResponderProof,
     TransmissionRequest,
@@ -640,8 +642,10 @@ impl<N: Network> Gateway<N> {
                 }
             }
             Event::TransmissionRequest(TransmissionRequest { transmission_id })
-            | Event::TransmissionResponse(TransmissionResponse { transmission_id, .. }) => {
-                // Skip processing this certificate if the rate limit was exceeded (i.e. someone is spamming a specific certificate).
+            | Event::TransmissionResponse(TransmissionResponse { transmission_id, .. })
+            | Event::LockRequest(LockRequest { transmission_id, .. })
+            | Event::LockResponse(LockResponse { transmission_id, .. }) => {
+                // Skip processing this transmission if the rate limit was exceeded (i.e. someone is spamming a specific transmission).
                 let num_events = self.cache.insert_inbound_transmission(transmission_id, CACHE_REQUESTS_INTERVAL);
                 if num_events >= self.max_cache_duplicates() {
                     return Ok(true);
@@ -799,6 +803,16 @@ impl<N: Network> Gateway<N> {
             Event::ChallengeRequest(..) | Event::ChallengeResponse(..) => {
                 // Disconnect as the peer is not following the protocol.
                 bail!("{CONTEXT} Peer '{peer_ip}' is not following the protocol")
+            }
+            Event::LockRequest(lock_request) => {
+                // Send the lock request to the primary.
+                let _ = self.primary_sender().tx_lock_request.send((peer_ip, lock_request)).await;
+                Ok(true)
+            }
+            Event::LockResponse(lock_response) => {
+                // Send the lock response to the primary.
+                let _ = self.primary_sender().tx_lock_response.send((peer_ip, lock_response)).await;
+                Ok(true)
             }
             Event::Disconnect(message) => {
                 // The peer informs us that they had disconnected. Disconnect from them too.

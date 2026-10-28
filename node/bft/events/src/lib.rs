@@ -48,6 +48,18 @@ pub use disconnect::{Disconnect, DisconnectReason};
 mod helpers;
 pub use helpers::*;
 
+mod lock_certificate;
+pub use lock_certificate::LockCertificate;
+
+mod lock_key;
+pub use lock_key::LockKey;
+
+mod lock_request;
+pub use lock_request::LockRequest;
+
+mod lock_response;
+pub use lock_response::LockResponse;
+
 mod primary_ping;
 pub use primary_ping::PrimaryPing;
 
@@ -105,6 +117,8 @@ pub enum Event<N: Network> {
     ChallengeRequest(ChallengeRequest<N>),
     ChallengeResponse(ChallengeResponse<N>),
     Disconnect(Disconnect),
+    LockRequest(LockRequest<N>),
+    LockResponse(LockResponse<N>),
     PrimaryPing(PrimaryPing<N>),
     TransmissionRequest(TransmissionRequest<N>),
     TransmissionResponse(TransmissionResponse<N>),
@@ -145,6 +159,7 @@ macro_rules! with_data_payload {
             Self::PrimaryPing(event) => $f(&mut event.primary_certificate),
             Self::BlockResponse(event) => $f(&mut event.blocks),
             Self::ChallengeResponse(event) => $f(&mut event.signature),
+            Self::LockRequest(event) => $f(&mut event.transaction),
             Self::TransmissionResponse(event) => match &mut event.transmission {
                 Transmission::Solution(solution) => $f(solution),
                 Transmission::Transaction(transaction) => $f(transaction),
@@ -162,6 +177,7 @@ macro_rules! with_data_payload {
             | Self::CertificateResponse(_)
             | Self::ChallengeRequest(_)
             | Self::Disconnect(_)
+            | Self::LockResponse(_)
             | Self::TransmissionRequest(_)
             | Self::ValidatorsRequest(_)
             | Self::ValidatorsResponse(_)
@@ -172,7 +188,7 @@ macro_rules! with_data_payload {
 
 impl<N: Network> Event<N> {
     /// The version of the event protocol; it can be incremented in order to force users to update.
-    pub const VERSION: u32 = 10;
+    pub const VERSION: u32 = 11;
 
     /// Serializes the event's [`Data`] payload, if it holds one that is not already serialized.
     ///
@@ -223,6 +239,8 @@ impl<N: Network> Event<N> {
             Self::ChallengeRequest(..) => "ChallengeRequest",
             Self::ChallengeResponse(..) => "ChallengeResponse",
             Self::Disconnect(..) => "Disconnect",
+            Self::LockRequest(..) => "LockRequest",
+            Self::LockResponse(..) => "LockResponse",
             Self::PrimaryPing(..) => "PrimaryPing",
             Self::TransmissionRequest(..) => "TransmissionRequest",
             Self::TransmissionResponse(..) => "TransmissionResponse",
@@ -246,6 +264,8 @@ impl<N: Network> Event<N> {
             Self::ChallengeRequest(event) => event.name(),
             Self::ChallengeResponse(event) => event.name(),
             Self::Disconnect(event) => event.name(),
+            Self::LockRequest(event) => event.name(),
+            Self::LockResponse(event) => event.name(),
             Self::PrimaryPing(event) => event.name(),
             Self::TransmissionRequest(event) => event.name(),
             Self::TransmissionResponse(event) => event.name(),
@@ -275,6 +295,8 @@ impl<N: Network> Event<N> {
             Self::ValidatorsRequest(..) => 13,
             Self::ValidatorsResponse(..) => 14,
             Self::WorkerPing(..) => 15,
+            Self::LockRequest(..) => 16,
+            Self::LockResponse(..) => 17,
         }
     }
 }
@@ -294,6 +316,8 @@ impl<N: Network> ToBytes for Event<N> {
             Self::ChallengeRequest(event) => event.write_le(writer),
             Self::ChallengeResponse(event) => event.write_le(writer),
             Self::Disconnect(event) => event.write_le(writer),
+            Self::LockRequest(event) => event.write_le(writer),
+            Self::LockResponse(event) => event.write_le(writer),
             Self::PrimaryPing(event) => event.write_le(writer),
             Self::TransmissionRequest(event) => event.write_le(writer),
             Self::TransmissionResponse(event) => event.write_le(writer),
@@ -327,7 +351,9 @@ impl<N: Network> FromBytes for Event<N> {
             13 => Self::ValidatorsRequest(ValidatorsRequest::read_le(&mut reader)?),
             14 => Self::ValidatorsResponse(ValidatorsResponse::read_le(&mut reader)?),
             15 => Self::WorkerPing(WorkerPing::read_le(&mut reader)?),
-            16.. => return Err(error(format!("Unknown event ID {id}"))),
+            16 => Self::LockRequest(LockRequest::read_le(&mut reader)?),
+            17 => Self::LockResponse(LockResponse::read_le(&mut reader)?),
+            18.. => return Err(error(format!("Unknown event ID {id}"))),
         };
 
         // Ensure that there are no "dangling" bytes.
@@ -376,6 +402,8 @@ pub mod prop_tests {
         certificate_response::prop_tests::any_certificate_response,
         challenge_request::prop_tests::any_challenge_request,
         challenge_response::prop_tests::any_challenge_response,
+        lock_request::prop_tests::any_lock_request,
+        lock_response::prop_tests::any_lock_response,
         primary_ping::prop_tests::any_primary_ping,
         transmission_request::prop_tests::any_transmission_request,
         transmission_response::prop_tests::any_transmission_response,
@@ -463,6 +491,8 @@ pub mod prop_tests {
                 any::<Selector>()
             )
                 .prop_map(|(reasons, selector)| Event::Disconnect(Disconnect::from(selector.select(reasons)))),
+            any_lock_request().prop_map(Event::LockRequest),
+            any_lock_response().prop_map(Event::LockResponse),
             any_primary_ping().prop_map(Event::PrimaryPing),
             any_transmission_request().prop_map(Event::TransmissionRequest),
             any_transmission_response().prop_map(Event::TransmissionResponse),
